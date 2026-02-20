@@ -790,8 +790,6 @@ async def on_ready():
 
     if not getattr(bot, "_views_added", False):
 
-        bot.add_view(MainView())      # para o painel principal continuar a funcionar após restart
-
         bot.add_view(IbanButtons())   # para botões do IBAN persistirem após restart
 
         bot._views_added = True
@@ -819,3 +817,4 @@ if not TOKEN:
 
 
 bot.run(TOKEN)
+
