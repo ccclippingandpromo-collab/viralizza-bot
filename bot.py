@@ -172,21 +172,22 @@ def is_verified(member: discord.Member) -> bool:
 
 # =========================
 
-class UsernameModal(discord.ui.Modal, title="Ligar Conta"):
+class UsernameModal(discord.ui.Modal):
+    def __init__(self, social: str, code: str):
+        super().__init__(title="Ligar Conta")
+        self.social = social
+        self.code = code
+
 
     username = discord.ui.InputText(
-
         label="Coloca o teu username",
-
         placeholder="@teu_username",
-
         required=True,
-
         max_length=64
 
     )
-
-
+    
+    self.add_item(self.username)
 
     def __init__(self, social: str, code: str):
 
@@ -1013,6 +1014,7 @@ if not TOKEN:
 keep_alive()
 
 bot.run(TOKEN)
+
 
 
 
