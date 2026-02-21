@@ -1006,9 +1006,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
 
-    raise RuntimeError("⚠️ TOKEN não encontrado. Define a variável de ambiente TOKEN no Render.")
+    raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável de ambiente TOKEN no Render.")
 
 keep_alive()
 
 bot.run(TOKEN)
+
 
