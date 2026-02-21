@@ -374,7 +374,7 @@ class SocialSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
 
-        social = self.values[0]
+        social = interaction.data["values"][0]
 
         code = f"VZ-{interaction.user.id}"
 
@@ -983,3 +983,4 @@ if not TOKEN:
 keep_alive()
 
 bot.run(TOKEN)
+
