@@ -172,9 +172,7 @@ class UsernameModal(discord.ui.Modal):
 
 
 
-        # discord.py usa TextInput (não InputText)
-
-        self.username = discord.ui.TextInput(
+        self.username = discord.ui.InputText(
 
             label="Coloca o teu username",
 
@@ -182,7 +180,7 @@ class UsernameModal(discord.ui.Modal):
 
             required=True,
 
-            max_length=64,
+            max_length=64
 
         )
 
@@ -190,7 +188,7 @@ class UsernameModal(discord.ui.Modal):
 
 
 
-    async def on_submit(self, interaction: discord.Interaction):
+    async def callback(self, interaction: discord.Interaction):
 
         user_id = interaction.user.id
 
@@ -204,7 +202,7 @@ class UsernameModal(discord.ui.Modal):
 
             "code": self.code,
 
-            "status": "pending",
+            "status": "pending"
 
         }
 
@@ -222,7 +220,7 @@ class UsernameModal(discord.ui.Modal):
 
             f"⏳ Agora aguarda a aprovação do staff.",
 
-            ephemeral=True,
+            ephemeral=True
 
         )
 
@@ -260,7 +258,7 @@ class UsernameModal(discord.ui.Modal):
 
             f"📌 Status: **PENDENTE**",
 
-            view=view,
+            view=view
 
         )
 
@@ -983,4 +981,5 @@ if not TOKEN:
 keep_alive()
 
 bot.run(TOKEN)
+
 
