@@ -1002,7 +1002,7 @@ def keep_alive():
 
 # =========================
 
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
 
@@ -1011,3 +1011,4 @@ if not TOKEN:
 keep_alive()
 
 bot.run(TOKEN)
+
