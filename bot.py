@@ -7,14 +7,16 @@ import threading
 
 
 import discord
-print("DISCORD VERSION:", discord.__version__)
-print("DISCORD FILE:", discord.__file__)
 
 from discord.ext import commands
 
 from flask import Flask
 
 
+
+print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
+
+print("DISCORD FILE:", getattr(discord, "__file__", "unknown"))
 
 
 
@@ -38,8 +40,6 @@ DB_PATH = "database.sqlite3"
 
 
 
-
-
 # =========================
 
 # BOT / INTENTS
@@ -58,8 +58,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 
-
-
 # =========================
 
 # "DB" EM MEMÓRIA (pendentes/verificados)
@@ -71,8 +69,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 pending_accounts = {}   # user_id -> {"social":..., "username":..., "code":..., "status":"pending"}
 
 verified_accounts = {}  # user_id -> {"social":..., "username":..., "code":..., "status":"verified"}
-
-
 
 
 
@@ -108,8 +104,6 @@ def init_db():
 
 
 
-
-
 def set_iban(user_id: int, iban: str):
 
     conn = sqlite3.connect(DB_PATH)
@@ -136,8 +130,6 @@ def set_iban(user_id: int, iban: str):
 
 
 
-
-
 def get_iban(user_id: int):
 
     conn = sqlite3.connect(DB_PATH)
@@ -154,15 +146,11 @@ def get_iban(user_id: int):
 
 
 
-
-
 def is_verified(member: discord.Member) -> bool:
 
     role = member.guild.get_role(VERIFICADO_ROLE_ID)
 
     return bool(role) and (role in member.roles)
-
-
 
 
 
@@ -173,29 +161,32 @@ def is_verified(member: discord.Member) -> bool:
 # =========================
 
 class UsernameModal(discord.ui.Modal):
+
     def __init__(self, social: str, code: str):
+
         super().__init__(title="Ligar Conta")
-        self.social = social
-        self.code = code
-
-
-    username = discord.ui.InputText(
-        label="Coloca o teu username",
-        placeholder="@teu_username",
-        required=True,
-        max_length=64
-
-    )
-    
-    self.add_item(self.username)
-
-    def __init__(self, social: str, code: str):
-
-        super().__init__()
 
         self.social = social
 
         self.code = code
+
+
+
+        # discord.py usa TextInput (não InputText)
+
+        self.username = discord.ui.TextInput(
+
+            label="Coloca o teu username",
+
+            placeholder="@teu_username",
+
+            required=True,
+
+            max_length=64,
+
+        )
+
+        self.add_item(self.username)
 
 
 
@@ -213,7 +204,7 @@ class UsernameModal(discord.ui.Modal):
 
             "code": self.code,
 
-            "status": "pending"
+            "status": "pending",
 
         }
 
@@ -231,7 +222,7 @@ class UsernameModal(discord.ui.Modal):
 
             f"⏳ Agora aguarda a aprovação do staff.",
 
-            ephemeral=True
+            ephemeral=True,
 
         )
 
@@ -269,27 +260,31 @@ class UsernameModal(discord.ui.Modal):
 
             f"📌 Status: **PENDENTE**",
 
-            view=view
+            view=view,
 
         )
 
 
 
+class IbanModal(discord.ui.Modal):
 
+    def __init__(self):
 
-class IbanModal(discord.ui.Modal, title="Adicionar / Atualizar IBAN"):
+        super().__init__(title="Adicionar / Atualizar IBAN")
 
-    iban = discord.ui.TextInput(
+        self.iban = discord.ui.TextInput(
 
-        label="Escreve o teu IBAN",
+            label="Escreve o teu IBAN",
 
-        placeholder="AO06 0000 0000 0000 0000 0000 0",
+            placeholder="AO06 0000 0000 0000 0000 0000 0",
 
-        required=True,
+            required=True,
 
-        max_length=64
+            max_length=64,
 
-    )
+        )
+
+        self.add_item(self.iban)
 
 
 
@@ -297,25 +292,25 @@ class IbanModal(discord.ui.Modal, title="Adicionar / Atualizar IBAN"):
 
         # Só verificados
 
-        if not interaction.guild:
+        guild = interaction.guild or bot.get_guild(SERVER_ID)
 
-            # Se estiver em DM, tenta pegar o guild principal
+        if not guild:
 
-            guild = bot.get_guild(SERVER_ID)
+            return await interaction.response.send_message("⚠️ Servidor não encontrado.", ephemeral=True)
 
-            if not guild:
 
-                return await interaction.response.send_message("⚠️ Servidor não encontrado.", ephemeral=True)
 
-            member = guild.get_member(interaction.user.id)
+        member = guild.get_member(interaction.user.id)
 
-            if not member:
+        if not member:
 
-                return await interaction.response.send_message("⚠️ Não te encontrei no servidor.", ephemeral=True)
+            try:
 
-        else:
+                member = await guild.fetch_member(interaction.user.id)
 
-            member = interaction.guild.get_member(interaction.user.id)
+            except:
+
+                member = None
 
 
 
@@ -325,7 +320,7 @@ class IbanModal(discord.ui.Modal, title="Adicionar / Atualizar IBAN"):
 
                 "⛔ Tens de estar **Verificado** para guardar IBAN.",
 
-                ephemeral=True
+                ephemeral=True,
 
             )
 
@@ -337,15 +332,7 @@ class IbanModal(discord.ui.Modal, title="Adicionar / Atualizar IBAN"):
 
 
 
-        await interaction.response.send_message(
-
-            "✅ IBAN guardado com sucesso.",
-
-            ephemeral=True
-
-        )
-
-
+        await interaction.response.send_message("✅ IBAN guardado com sucesso.", ephemeral=True)
 
 
 
@@ -379,7 +366,7 @@ class SocialSelect(discord.ui.Select):
 
             options=options,
 
-            custom_id="social_select"  # (não precisa ser persistente, mas ok)
+            custom_id="social_select",
 
         )
 
@@ -392,8 +379,6 @@ class SocialSelect(discord.ui.Select):
         code = f"VZ-{interaction.user.id}"
 
         await interaction.response.send_modal(UsernameModal(social=social, code=code))
-
-
 
 
 
@@ -413,7 +398,7 @@ class ConnectButton(discord.ui.Button):
 
             style=discord.ButtonStyle.green,
 
-            custom_id="btn_connect_social"
+            custom_id="btn_connect_social",
 
         )
 
@@ -425,17 +410,7 @@ class ConnectButton(discord.ui.Button):
 
         view.add_item(SocialSelect())
 
-        await interaction.response.send_message(
-
-            "Escolhe a rede social:",
-
-            view=view,
-
-            ephemeral=True
-
-        )
-
-
+        await interaction.response.send_message("Escolhe a rede social:", view=view, ephemeral=True)
 
 
 
@@ -449,7 +424,7 @@ class ViewAccountsButton(discord.ui.Button):
 
             style=discord.ButtonStyle.blurple,
 
-            custom_id="btn_view_account"
+            custom_id="btn_view_account",
 
         )
 
@@ -485,8 +460,6 @@ class ViewAccountsButton(discord.ui.Button):
 
 
 
-
-
 class MainView(discord.ui.View):
 
     def __init__(self):
@@ -496,8 +469,6 @@ class MainView(discord.ui.View):
         self.add_item(ConnectButton())
 
         self.add_item(ViewAccountsButton())
-
-
 
 
 
@@ -521,13 +492,11 @@ class IbanButtons(discord.ui.View):
 
         style=discord.ButtonStyle.primary,
 
-        custom_id="iban_add"
+        custom_id="iban_add",
 
     )
 
     async def add_iban(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        # Se estiver no servidor, verifica role
 
         guild = interaction.guild or bot.get_guild(SERVER_ID)
 
@@ -539,13 +508,25 @@ class IbanButtons(discord.ui.View):
 
         member = guild.get_member(interaction.user.id)
 
+        if not member:
+
+            try:
+
+                member = await guild.fetch_member(interaction.user.id)
+
+            except:
+
+                member = None
+
+
+
         if not member or not is_verified(member):
 
             return await interaction.response.send_message(
 
                 "⛔ Tens de estar **Verificado** para adicionar IBAN.",
 
-                ephemeral=True
+                ephemeral=True,
 
             )
 
@@ -561,7 +542,7 @@ class IbanButtons(discord.ui.View):
 
         style=discord.ButtonStyle.secondary,
 
-        custom_id="iban_view"
+        custom_id="iban_view",
 
     )
 
@@ -577,13 +558,25 @@ class IbanButtons(discord.ui.View):
 
         member = guild.get_member(interaction.user.id)
 
+        if not member:
+
+            try:
+
+                member = await guild.fetch_member(interaction.user.id)
+
+            except:
+
+                member = None
+
+
+
         if not member or not is_verified(member):
 
             return await interaction.response.send_message(
 
                 "⛔ Tens de estar **Verificado** para ver IBAN.",
 
-                ephemeral=True
+                ephemeral=True,
 
             )
 
@@ -593,13 +586,7 @@ class IbanButtons(discord.ui.View):
 
         if not row:
 
-            return await interaction.response.send_message(
-
-                "Ainda não tens IBAN guardado.",
-
-                ephemeral=True
-
-            )
+            return await interaction.response.send_message("Ainda não tens IBAN guardado.", ephemeral=True)
 
 
 
@@ -609,11 +596,9 @@ class IbanButtons(discord.ui.View):
 
             f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}",
 
-            ephemeral=True
+            ephemeral=True,
 
         )
-
-
 
 
 
@@ -675,8 +660,6 @@ class ApprovalView(discord.ui.View):
 
 
 
-        # buscar membro
-
         member = guild.get_member(self.target_user_id)
 
         if not member:
@@ -687,13 +670,17 @@ class ApprovalView(discord.ui.View):
 
             except:
 
-                await interaction.response.send_message("⚠️ Não consegui buscar o membro.", ephemeral=True)
-
-                return
+                member = None
 
 
 
-        # cargo
+        if not member:
+
+            await interaction.response.send_message("⚠️ Não consegui buscar o membro.", ephemeral=True)
+
+            return
+
+
 
         role = guild.get_role(VERIFICADO_ROLE_ID)
 
@@ -715,15 +702,13 @@ class ApprovalView(discord.ui.View):
 
                 "⛔ Sem permissões para dar cargo. (Cargo do bot precisa estar acima do 'Verificado')",
 
-                ephemeral=True
+                ephemeral=True,
 
             )
 
             return
 
 
-
-        # move pending -> verified
 
         data["status"] = "verified"
 
@@ -733,7 +718,7 @@ class ApprovalView(discord.ui.View):
 
 
 
-        # DM ao user + manda os botões de IBAN (só depois de aprovado)
+        # DM ao user + manda os botões de IBAN
 
         try:
 
@@ -747,7 +732,7 @@ class ApprovalView(discord.ui.View):
 
                 "Agora podes adicionar o teu IBAN aqui 👇",
 
-                view=IbanButtons()
+                view=IbanButtons(),
 
             )
 
@@ -756,8 +741,6 @@ class ApprovalView(discord.ui.View):
             pass
 
 
-
-        # desativa botões na msg
 
         for child in self.children:
 
@@ -769,7 +752,7 @@ class ApprovalView(discord.ui.View):
 
             content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **APROVADO ✅**"),
 
-            view=self
+            view=self,
 
         )
 
@@ -849,13 +832,11 @@ class ApprovalView(discord.ui.View):
 
             content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **REJEITADO ❌**"),
 
-            view=self
+            view=self,
 
         )
 
         await interaction.response.send_message("❌ Rejeitado.", ephemeral=True)
-
-
 
 
 
@@ -877,8 +858,6 @@ async def ligar(ctx):
 
 
 
-
-
 @bot.command()
 
 async def ibanpanel(ctx):
@@ -890,8 +869,6 @@ async def ibanpanel(ctx):
         return
 
     await ctx.send("**Painel IBAN (apenas verificados)**", view=IbanButtons())
-
-
 
 
 
@@ -927,8 +904,6 @@ async def iban(ctx, member: discord.Member = None):
 
 
 
-
-
 # =========================
 
 # READY (registrar views persistentes)
@@ -942,8 +917,6 @@ async def on_ready():
     init_db()
 
 
-
-    # Regista as views persistentes uma vez
 
     if not getattr(bot, "_views_added", False):
 
@@ -959,11 +932,9 @@ async def on_ready():
 
 
 
-
-
 # =========================
 
-# KEEP-ALIVE (Render Web Service Free)
+# WEB (Railway)
 
 # =========================
 
@@ -981,9 +952,7 @@ def home():
 
 def run_web():
 
-    # Render costuma definir PORT; se não tiver, usa 10000
-
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", "8080"))
 
     app.run(host="0.0.0.0", port=port)
 
@@ -997,8 +966,6 @@ def keep_alive():
 
 
 
-
-
 # =========================
 
 # RUN
@@ -1009,12 +976,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
 
-    raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável de ambiente TOKEN no Render.")
+    raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável DISCORD_TOKEN na Railway.")
+
+
 
 keep_alive()
 
 bot.run(TOKEN)
-
-
-
-
