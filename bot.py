@@ -7,6 +7,8 @@ import threading
 
 
 import discord
+print("DISCORD VERSION:", discord.__version__)
+print("DISCORD FILE:", discord.__file__)
 
 from discord.ext import commands
 
@@ -172,7 +174,7 @@ def is_verified(member: discord.Member) -> bool:
 
 class UsernameModal(discord.ui.Modal, title="Ligar Conta"):
 
-    username = discord.ui.TextInput(
+    username = discord.ui.InputText(
 
         label="Coloca o teu username",
 
@@ -1011,5 +1013,6 @@ if not TOKEN:
 keep_alive()
 
 bot.run(TOKEN)
+
 
 
