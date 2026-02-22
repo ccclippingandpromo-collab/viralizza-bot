@@ -14,12 +14,6 @@ from flask import Flask
 
 
 
-# UI imports (OBRIGATÓRIO para Modal/View/Button/TextInput)
-
-from discord.ui import View, Button, Modal, TextInput
-
-
-
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
 
 print("DISCORD FILE:", getattr(discord, "__file__", "unknown"))
@@ -62,8 +56,6 @@ intents.message_content = True
 
 intents.members = True
 
-intents.messages = True
-
 
 
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -72,9 +64,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
 
-# "DB" EM MEMÓRIA (pendentes/verificados)
-
-# (reseta ao reiniciar)
+# MEMÓRIA (pendentes/verificados)
 
 # =========================
 
@@ -86,7 +76,7 @@ verified_accounts = {}  # user_id -> {"social":..., "username":..., "code":..., 
 
 # =========================
 
-# SQLITE (IBAN + SUPORTE no mesmo DB)
+# DB INIT (IBAN + SUPORTE)
 
 # =========================
 
@@ -142,6 +132,8 @@ def init_db():
 
 
 
+# ===== IBAN HELPERS =====
+
 def set_iban(user_id: int, iban: str):
 
     conn = sqlite3.connect(DB_PATH)
@@ -184,7 +176,7 @@ def get_iban(user_id: int):
 
 
 
-# ====== SUPORTE DB HELPERS ======
+# ===== SUPORTE HELPERS =====
 
 def set_ticket(thread_id: int, user_id: int):
 
@@ -274,9 +266,27 @@ def is_verified(member: discord.Member) -> bool:
 
 
 
+async def fetch_member_safe(guild: discord.Guild, user_id: int):
+
+    m = guild.get_member(user_id)
+
+    if m:
+
+        return m
+
+    try:
+
+        return await guild.fetch_member(user_id)
+
+    except:
+
+        return None
+
+
+
 # =========================
 
-# SUPORTE: Ticket creator
+# SUPORTE: Criar ticket
 
 # =========================
 
@@ -291,8 +301,6 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: st
         return
 
 
-
-    # cria mensagem no canal staff
 
     msg = await staff_channel.send(
 
@@ -310,23 +318,33 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: st
 
 
 
-    # cria thread do ticket
+    try:
 
-    thread = await msg.create_thread(
+        thread = await msg.create_thread(
 
-        name=f"ticket-{interaction.user.name}-{interaction.user.id}",
+            name=f"ticket-{interaction.user.name}-{interaction.user.id}",
 
-        auto_archive_duration=1440
+            auto_archive_duration=1440
 
-    )
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+
+            "❌ O bot não tem permissão para criar threads no canal suporte-staff.",
+
+            ephemeral=True
+
+        )
+
+        return
 
 
 
     set_ticket(thread.id, interaction.user.id)
 
 
-
-    # DM ao user com instrução
 
     try:
 
@@ -338,7 +356,7 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: st
 
             "Quando o staff responder, vais receber aqui também.\n\n"
 
-            "⚠️ Se não receberes DMs, ativa: *Server Privacy > Allow Direct Messages*."
+            "⚠️ Se não receberes DMs: abre as DMs do servidor."
 
         )
 
@@ -364,45 +382,83 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: st
 
 # =========================
 
-# SUPORTE: Modals
+# SUPORTE: Modals + View
 
 # =========================
 
-class CampanhaModal(Modal, title="Problema sobre campanha"):
+class CampanhaModal(discord.ui.Modal):
 
-    campanha = TextInput(label="Nome da campanha", placeholder="Ex: Campanha AfroBeat", required=True)
+    def __init__(self):
 
-    problema = TextInput(label="Qual é o problema?", style=discord.TextStyle.paragraph, required=True)
+        super().__init__(title="Problema sobre campanha")
+
+        self.campanha = discord.ui.TextInput(
+
+            label="Nome da campanha",
+
+            placeholder="Ex: Campanha AfroBeat",
+
+            required=True,
+
+            max_length=80
+
+        )
+
+        self.problema = discord.ui.TextInput(
+
+            label="Qual é o problema?",
+
+            style=discord.TextStyle.paragraph,
+
+            required=True,
+
+            max_length=1000
+
+        )
+
+        self.add_item(self.campanha)
+
+        self.add_item(self.problema)
 
 
 
     async def on_submit(self, interaction: discord.Interaction):
 
-        texto = f"📢 Campanha: {self.campanha}\n⚠️ Problema: {self.problema}"
+        texto = f"📢 Campanha: {self.campanha.value}\n⚠️ Problema: {self.problema.value}"
 
         await criar_ticket(interaction, "Problema com campanha", texto)
 
 
 
-class DuvidaModal(Modal, title="Dúvidas"):
+class DuvidaModal(discord.ui.Modal):
 
-    duvida = TextInput(label="Escreve a tua dúvida", style=discord.TextStyle.paragraph, required=True)
+    def __init__(self):
+
+        super().__init__(title="Dúvidas")
+
+        self.duvida = discord.ui.TextInput(
+
+            label="Escreve a tua dúvida",
+
+            style=discord.TextStyle.paragraph,
+
+            required=True,
+
+            max_length=1000
+
+        )
+
+        self.add_item(self.duvida)
 
 
 
     async def on_submit(self, interaction: discord.Interaction):
 
-        await criar_ticket(interaction, "Dúvida", str(self.duvida))
+        await criar_ticket(interaction, "Dúvida", self.duvida.value)
 
 
 
-# =========================
-
-# SUPORTE: View com Botões
-
-# =========================
-
-class SuporteView(View):
+class SuporteView(discord.ui.View):
 
     def __init__(self):
 
@@ -410,17 +466,33 @@ class SuporteView(View):
 
 
 
-    @discord.ui.button(label="📢 Problema sobre campanha", style=discord.ButtonStyle.danger, custom_id="support_campaign")
+    @discord.ui.button(
 
-    async def campanha(self, interaction: discord.Interaction, button: Button):
+        label="📢 Problema sobre campanha",
+
+        style=discord.ButtonStyle.danger,
+
+        custom_id="support_campaign_btn"
+
+    )
+
+    async def campanha(self, interaction: discord.Interaction, button: discord.ui.Button):
 
         await interaction.response.send_modal(CampanhaModal())
 
 
 
-    @discord.ui.button(label="❓ Dúvidas", style=discord.ButtonStyle.primary, custom_id="support_question")
+    @discord.ui.button(
 
-    async def duvida(self, interaction: discord.Interaction, button: Button):
+        label="❓ Dúvidas",
+
+        style=discord.ButtonStyle.primary,
+
+        custom_id="support_question_btn"
+
+    )
+
+    async def duvida(self, interaction: discord.Interaction, button: discord.ui.Button):
 
         await interaction.response.send_modal(DuvidaModal())
 
@@ -461,6 +533,8 @@ async def fechar_ticket(ctx):
         await ctx.send("❌ Usa este comando dentro do thread do ticket.")
 
         return
+
+
 
     close_ticket(ctx.channel.id)
 
@@ -504,7 +578,7 @@ class UsernameModal(discord.ui.Modal):
 
 
 
-    async def callback(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
 
         user_id = interaction.user.id
 
@@ -598,72 +672,6 @@ class UsernameModal(discord.ui.Modal):
 
 # =========================
 
-# IBAN: Modal
-
-# =========================
-
-class IbanModal(discord.ui.Modal):
-
-    def __init__(self):
-
-        super().__init__(title="Adicionar / Atualizar IBAN")
-
-        self.iban = discord.ui.TextInput(
-
-            label="Escreve o teu IBAN",
-
-            placeholder="AO06 0000 0000 0000 0000 0000 0",
-
-            required=True,
-
-            max_length=64,
-
-        )
-
-        self.add_item(self.iban)
-
-
-
-    async def on_submit(self, interaction: discord.Interaction):
-
-        guild = interaction.guild or bot.get_guild(SERVER_ID)
-
-        if not guild:
-
-            return await interaction.response.send_message("⚠️ Servidor não encontrado.", ephemeral=True)
-
-
-
-        member = guild.get_member(interaction.user.id)
-
-        if not member:
-
-            try:
-
-                member = await guild.fetch_member(interaction.user.id)
-
-            except:
-
-                member = None
-
-
-
-        if not member or not is_verified(member):
-
-            return await interaction.response.send_message("⛔ Tens de estar **Verificado** para guardar IBAN.", ephemeral=True)
-
-
-
-        iban_value = str(self.iban.value).strip()
-
-        set_iban(interaction.user.id, iban_value)
-
-        await interaction.response.send_message("✅ IBAN guardado com sucesso.", ephemeral=True)
-
-
-
-# =========================
-
 # SELECT (TikTok / YouTube / Instagram)
 
 # =========================
@@ -692,7 +700,7 @@ class SocialSelect(discord.ui.Select):
 
             options=options,
 
-            custom_id="social_select",
+            custom_id="social_select"
 
         )
 
@@ -724,7 +732,7 @@ class ConnectButton(discord.ui.Button):
 
             style=discord.ButtonStyle.green,
 
-            custom_id="btn_connect_social",
+            custom_id="btn_connect_social"
 
         )
 
@@ -732,11 +740,11 @@ class ConnectButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
 
-        view = discord.ui.View(timeout=120)
+        v = discord.ui.View(timeout=120)
 
-        view.add_item(SocialSelect())
+        v.add_item(SocialSelect())
 
-        await interaction.response.send_message("Escolhe a rede social:", view=view, ephemeral=True)
+        await interaction.response.send_message("Escolhe a rede social:", view=v, ephemeral=True)
 
 
 
@@ -750,7 +758,7 @@ class ViewAccountsButton(discord.ui.Button):
 
             style=discord.ButtonStyle.blurple,
 
-            custom_id="btn_view_account",
+            custom_id="btn_view_account"
 
         )
 
@@ -796,9 +804,55 @@ class MainView(discord.ui.View):
 
 # =========================
 
-# IBAN VIEW (persistente)
+# IBAN: Modal + View
 
 # =========================
+
+class IbanModal(discord.ui.Modal):
+
+    def __init__(self):
+
+        super().__init__(title="Adicionar / Atualizar IBAN")
+
+        self.iban = discord.ui.TextInput(
+
+            label="Escreve o teu IBAN",
+
+            placeholder="AO06 0000 0000 0000 0000 0000 0",
+
+            required=True,
+
+            max_length=64
+
+        )
+
+        self.add_item(self.iban)
+
+
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        guild = interaction.guild or bot.get_guild(SERVER_ID)
+
+        if not guild:
+
+            return await interaction.response.send_message("⚠️ Servidor não encontrado.", ephemeral=True)
+
+
+
+        member = await fetch_member_safe(guild, interaction.user.id)
+
+        if not member or not is_verified(member):
+
+            return await interaction.response.send_message("⛔ Tens de estar **Verificado** para guardar IBAN.", ephemeral=True)
+
+
+
+        set_iban(interaction.user.id, str(self.iban.value).strip())
+
+        await interaction.response.send_message("✅ IBAN guardado com sucesso.", ephemeral=True)
+
+
 
 class IbanButtons(discord.ui.View):
 
@@ -820,19 +874,7 @@ class IbanButtons(discord.ui.View):
 
 
 
-        member = guild.get_member(interaction.user.id)
-
-        if not member:
-
-            try:
-
-                member = await guild.fetch_member(interaction.user.id)
-
-            except:
-
-                member = None
-
-
+        member = await fetch_member_safe(guild, interaction.user.id)
 
         if not member or not is_verified(member):
 
@@ -856,19 +898,7 @@ class IbanButtons(discord.ui.View):
 
 
 
-        member = guild.get_member(interaction.user.id)
-
-        if not member:
-
-            try:
-
-                member = await guild.fetch_member(interaction.user.id)
-
-            except:
-
-                member = None
-
-
+        member = await fetch_member_safe(guild, interaction.user.id)
 
         if not member or not is_verified(member):
 
@@ -886,7 +916,13 @@ class IbanButtons(discord.ui.View):
 
         iban, updated_at = row
 
-        await interaction.response.send_message(f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}", ephemeral=True)
+        await interaction.response.send_message(
+
+            f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}",
+
+            ephemeral=True
+
+        )
 
 
 
@@ -948,19 +984,7 @@ class ApprovalView(discord.ui.View):
 
 
 
-        member = guild.get_member(self.target_user_id)
-
-        if not member:
-
-            try:
-
-                member = await guild.fetch_member(self.target_user_id)
-
-            except:
-
-                member = None
-
-
+        member = await fetch_member_safe(guild, self.target_user_id)
 
         if not member:
 
@@ -990,7 +1014,7 @@ class ApprovalView(discord.ui.View):
 
                 "⛔ Sem permissões para dar cargo. (Cargo do bot precisa estar acima do 'Verificado')",
 
-                ephemeral=True,
+                ephemeral=True
 
             )
 
@@ -1018,7 +1042,7 @@ class ApprovalView(discord.ui.View):
 
                 "Agora podes adicionar o teu IBAN aqui 👇",
 
-                view=IbanButtons(),
+                view=IbanButtons()
 
             )
 
@@ -1038,7 +1062,7 @@ class ApprovalView(discord.ui.View):
 
             content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **APROVADO ✅**"),
 
-            view=self,
+            view=self
 
         )
 
@@ -1068,21 +1092,7 @@ class ApprovalView(discord.ui.View):
 
         guild = bot.get_guild(SERVER_ID)
 
-        member = None
-
-        if guild:
-
-            member = guild.get_member(self.target_user_id)
-
-            if not member:
-
-                try:
-
-                    member = await guild.fetch_member(self.target_user_id)
-
-                except:
-
-                    member = None
+        member = await fetch_member_safe(guild, self.target_user_id) if guild else None
 
 
 
@@ -1090,7 +1100,13 @@ class ApprovalView(discord.ui.View):
 
             try:
 
-                await member.send("❌ **Verificação rejeitada.**\nConfere se o username está certo e tenta novamente.")
+                await member.send(
+
+                    "❌ **Verificação rejeitada.**\n"
+
+                    "Confere se o username está certo e tenta novamente."
+
+                )
 
             except:
 
@@ -1112,7 +1128,7 @@ class ApprovalView(discord.ui.View):
 
             content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **REJEITADO ❌**"),
 
-            view=self,
+            view=self
 
         )
 
@@ -1122,7 +1138,7 @@ class ApprovalView(discord.ui.View):
 
 # =========================
 
-# COMANDOS
+# COMANDOS (LIGAR / IBAN)
 
 # =========================
 
@@ -1158,15 +1174,21 @@ async def iban(ctx, member: discord.Member = None):
 
         return await ctx.send("⛔ Só o admin pode usar este comando.")
 
+
+
     if member is None:
 
         return await ctx.send("Usa: `!iban @user`")
+
+
 
     row = get_iban(member.id)
 
     if not row:
 
         return await ctx.send(f"❌ {member.mention} não tem IBAN guardado.")
+
+
 
     iban_value, updated_at = row
 
@@ -1176,7 +1198,7 @@ async def iban(ctx, member: discord.Member = None):
 
 # =========================
 
-# RELAY (UM on_message apenas)
+# ON_MESSAGE (UM SÓ) - Relay suporte + comandos
 
 # =========================
 
@@ -1262,7 +1284,7 @@ async def on_message(message: discord.Message):
 
 async def on_ready():
 
-    init_db()  # cria tabelas IBAN + SUPPORT
+    init_db()
 
 
 
@@ -1272,7 +1294,9 @@ async def on_ready():
 
         bot.add_view(IbanButtons())
 
-        bot.add_view(SuporteView())  # <- importante: view persistente do suporte
+        bot.add_view(SuporteView())
+
+        # ApprovalView não precisa add_view global porque é criado por target_user_id (dinâmico)
 
         bot._views_added = True
 
@@ -1326,7 +1350,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
 
-    raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável DISCORD_TOKEN no Render/Railway.")
+    raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável DISCORD_TOKEN na Railway/Render.")
 
 
 
