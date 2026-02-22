@@ -16,7 +16,6 @@ SERVER_ID = 1473469552917741678
 VERIFICACOES_CHANNEL_ID = 1473886076476067850
 VERIFICADO_ROLE_ID = 1473886534439538699
 ADMIN_USER_ID = 1376499031890460714
-
 SUPORTE_STAFF_CHANNEL_ID = 1474938549181874320
 
 DB_PATH = "database.sqlite3"
@@ -27,7 +26,8 @@ DB_PATH = "database.sqlite3"
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.messages = True  # para relay DM / threads
+intents.messages = True  # relay DM / threads
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
@@ -35,6 +35,40 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =========================
 pending_accounts = {}   # user_id -> {"social":..., "username":..., "code":..., "status":"pending"}
 verified_accounts = {}  # user_id -> {"social":..., "username":..., "code":..., "status":"verified"}
+
+# =========================
+# HELPERS: Compatibilidade de callback (ordem Interaction/Button)
+# =========================
+def _get_interaction(a, b) -> discord.Interaction | None:
+    if isinstance(a, discord.Interaction):
+        return a
+    if isinstance(b, discord.Interaction):
+        return b
+    return None
+
+def _safe_button_pair(a, b):
+    """
+    Devolve (interaction, button) independentemente da ordem que a lib usar.
+    """
+    interaction = _get_interaction(a, b)
+    button = None
+    if isinstance(a, discord.ui.Button):
+        button = a
+    elif isinstance(b, discord.ui.Button):
+        button = b
+    return interaction, button
+
+async def _safe_ephemeral(interaction: discord.Interaction, content: str):
+    """
+    Envia resposta ephemeral sem crashar se a interaction já foi respondida.
+    """
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+    except:
+        pass
 
 # =========================
 # DB INIT (IBAN + SUPORTE)
@@ -145,8 +179,7 @@ async def fetch_member_safe(guild: discord.Guild, user_id: int):
 async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: str):
     staff_channel = interaction.client.get_channel(SUPORTE_STAFF_CHANNEL_ID)
     if not staff_channel:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("❌ Canal de suporte do staff não encontrado.", ephemeral=True)
+        await _safe_ephemeral(interaction, "❌ Canal de suporte do staff não encontrado.")
         return
 
     msg = await staff_channel.send(
@@ -163,16 +196,16 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: st
             auto_archive_duration=1440
         )
     except discord.Forbidden:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "❌ O bot não tem permissão para criar threads no canal suporte-staff.",
-                ephemeral=True
-            )
+        await _safe_ephemeral(
+            interaction,
+            "❌ O bot não tem permissão para criar threads no canal suporte-staff.\n"
+            "Dá ao bot: **Create Public Threads / Create Private Threads / Send Messages / Manage Threads**."
+        )
         return
 
     set_ticket(thread.id, interaction.user.id)
 
-    # DM ao user com instrução
+    # DM ao user
     try:
         await interaction.user.send(
             "✅ **Ticket aberto com o staff!**\n\n"
@@ -183,12 +216,7 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: st
     except discord.Forbidden:
         await thread.send("⚠️ Não consegui enviar DM ao user (DMs fechadas).")
 
-    if not interaction.response.is_done():
-        await interaction.response.send_message(
-            "✅ Pedido enviado ao staff! Verifica as tuas DMs para continuar o suporte.",
-            ephemeral=True
-        )
-
+    await _safe_ephemeral(interaction, "✅ Pedido enviado ao staff! Verifica as tuas DMs para continuar o suporte.")
     await thread.send("🟢 Ticket aberto. Tudo que o user escrever por DM vai cair aqui. Staff respondam aqui.")
 
 # =========================
@@ -237,22 +265,26 @@ class SuporteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    # ✅ ORDEM CERTA: (interaction, button)
     @discord.ui.button(
         label="📢 Problema sobre campanha",
         style=discord.ButtonStyle.danger,
         custom_id="support_btn_campaign"
     )
-    async def btn_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_campaign(self, a, b):
+        interaction, _ = _safe_button_pair(a, b)
+        if not interaction:
+            return
         await interaction.response.send_modal(CampanhaModal())
 
-    # ✅ ORDEM CERTA: (interaction, button)
     @discord.ui.button(
         label="❓ Dúvidas",
         style=discord.ButtonStyle.primary,
         custom_id="support_btn_question"
     )
-    async def btn_question(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_question(self, a, b):
+        interaction, _ = _safe_button_pair(a, b)
+        if not interaction:
+            return
         await interaction.response.send_modal(DuvidaModal())
 
 @commands.has_permissions(administrator=True)
@@ -417,50 +449,55 @@ class IbanModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild or bot.get_guild(SERVER_ID)
         if not guild:
-            return await interaction.response.send_message("⚠️ Servidor não encontrado.", ephemeral=True)
+            return await _safe_ephemeral(interaction, "⚠️ Servidor não encontrado.")
 
         member = await fetch_member_safe(guild, interaction.user.id)
         if not member or not is_verified(member):
-            return await interaction.response.send_message("⛔ Tens de estar **Verificado** para guardar IBAN.", ephemeral=True)
+            return await _safe_ephemeral(interaction, "⛔ Tens de estar **Verificado** para guardar IBAN.")
 
         set_iban(interaction.user.id, str(self.iban.value).strip())
-        await interaction.response.send_message("✅ IBAN guardado com sucesso.", ephemeral=True)
+        await _safe_ephemeral(interaction, "✅ IBAN guardado com sucesso.")
 
 class IbanButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Adicionar / Atualizar IBAN", style=discord.ButtonStyle.primary, custom_id="iban_add")
-    async def add_iban(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def add_iban(self, a, b):
+        interaction, _ = _safe_button_pair(a, b)
+        if not interaction:
+            return
+
         guild = interaction.guild or bot.get_guild(SERVER_ID)
         if not guild:
-            return await interaction.response.send_message("⚠️ Servidor não encontrado.", ephemeral=True)
+            return await _safe_ephemeral(interaction, "⚠️ Servidor não encontrado.")
 
         member = await fetch_member_safe(guild, interaction.user.id)
         if not member or not is_verified(member):
-            return await interaction.response.send_message("⛔ Tens de estar **Verificado** para adicionar IBAN.", ephemeral=True)
+            return await _safe_ephemeral(interaction, "⛔ Tens de estar **Verificado** para adicionar IBAN.")
 
         await interaction.response.send_modal(IbanModal())
 
     @discord.ui.button(label="Ver meu IBAN", style=discord.ButtonStyle.secondary, custom_id="iban_view")
-    async def view_iban(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def view_iban(self, a, b):
+        interaction, _ = _safe_button_pair(a, b)
+        if not interaction:
+            return
+
         guild = interaction.guild or bot.get_guild(SERVER_ID)
         if not guild:
-            return await interaction.response.send_message("⚠️ Servidor não encontrado.", ephemeral=True)
+            return await _safe_ephemeral(interaction, "⚠️ Servidor não encontrado.")
 
         member = await fetch_member_safe(guild, interaction.user.id)
         if not member or not is_verified(member):
-            return await interaction.response.send_message("⛔ Tens de estar **Verificado** para ver IBAN.", ephemeral=True)
+            return await _safe_ephemeral(interaction, "⛔ Tens de estar **Verificado** para ver IBAN.")
 
         row = get_iban(interaction.user.id)
         if not row:
-            return await interaction.response.send_message("Ainda não tens IBAN guardado.", ephemeral=True)
+            return await _safe_ephemeral(interaction, "Ainda não tens IBAN guardado.")
 
         iban, updated_at = row
-        await interaction.response.send_message(
-            f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}",
-            ephemeral=True
-        )
+        await _safe_ephemeral(interaction, f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}")
 
 # =========================
 # APROVAR / REJEITAR
@@ -472,48 +509,48 @@ class ApprovalView(discord.ui.View):
 
     async def _only_admin(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != ADMIN_USER_ID:
-            await interaction.response.send_message("⛔ Só o admin pode aprovar/rejeitar.", ephemeral=True)
+            await _safe_ephemeral(interaction, "⛔ Só o admin pode aprovar/rejeitar.")
             return False
         return True
 
     @discord.ui.button(label="✅ Aprovar", style=discord.ButtonStyle.green, custom_id="approve_btn")
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def approve(self, a, b):
+        interaction, _ = _safe_button_pair(a, b)
+        if not interaction:
+            return
         if not await self._only_admin(interaction):
             return
 
         data = pending_accounts.get(self.target_user_id)
         if not data:
-            await interaction.response.send_message("⚠️ Este pedido já não existe.", ephemeral=True)
-            return
+            return await _safe_ephemeral(interaction, "⚠️ Este pedido já não existe.")
 
         guild = bot.get_guild(SERVER_ID)
         if not guild:
-            await interaction.response.send_message("⚠️ Guild não encontrada.", ephemeral=True)
-            return
+            return await _safe_ephemeral(interaction, "⚠️ Guild não encontrada.")
 
         member = await fetch_member_safe(guild, self.target_user_id)
         if not member:
-            await interaction.response.send_message("⚠️ Não consegui buscar o membro.", ephemeral=True)
-            return
+            return await _safe_ephemeral(interaction, "⚠️ Não consegui buscar o membro.")
 
         role = guild.get_role(VERIFICADO_ROLE_ID)
         if not role:
-            await interaction.response.send_message("⚠️ Cargo 'Verificado' não encontrado.", ephemeral=True)
-            return
+            return await _safe_ephemeral(interaction, "⚠️ Cargo 'Verificado' não encontrado.")
 
         try:
             await member.add_roles(role, reason="Verificação aprovada")
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "⛔ Sem permissões para dar cargo. (Cargo do bot precisa estar acima do 'Verificado')",
-                ephemeral=True
+            return await _safe_ephemeral(
+                interaction,
+                "⛔ Sem permissões para dar cargo.\n"
+                "O cargo do bot tem de estar acima do cargo **Verificado**."
             )
-            return
 
         data["status"] = "verified"
         verified_accounts[self.target_user_id] = data
         pending_accounts.pop(self.target_user_id, None)
 
+        # DM com painel IBAN
         try:
             await member.send(
                 "✅ **Verificação aprovada!**\n"
@@ -525,24 +562,31 @@ class ApprovalView(discord.ui.View):
         except:
             pass
 
+        # desativar botões na mensagem de verificação
         for child in self.children:
             child.disabled = True
 
-        await interaction.message.edit(
-            content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **APROVADO ✅**"),
-            view=self
-        )
-        await interaction.response.send_message("✅ Aprovado e cargo atribuído.", ephemeral=True)
+        try:
+            await interaction.message.edit(
+                content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **APROVADO ✅**"),
+                view=self
+            )
+        except:
+            pass
+
+        await _safe_ephemeral(interaction, "✅ Aprovado e cargo atribuído.")
 
     @discord.ui.button(label="❌ Rejeitar", style=discord.ButtonStyle.red, custom_id="reject_btn")
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def reject(self, a, b):
+        interaction, _ = _safe_button_pair(a, b)
+        if not interaction:
+            return
         if not await self._only_admin(interaction):
             return
 
         data = pending_accounts.get(self.target_user_id)
         if not data:
-            await interaction.response.send_message("⚠️ Este pedido já não existe.", ephemeral=True)
-            return
+            return await _safe_ephemeral(interaction, "⚠️ Este pedido já não existe.")
 
         guild = bot.get_guild(SERVER_ID)
         member = await fetch_member_safe(guild, self.target_user_id) if guild else None
@@ -561,11 +605,15 @@ class ApprovalView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        await interaction.message.edit(
-            content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **REJEITADO ❌**"),
-            view=self
-        )
-        await interaction.response.send_message("❌ Rejeitado.", ephemeral=True)
+        try:
+            await interaction.message.edit(
+                content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **REJEITADO ❌**"),
+                view=self
+            )
+        except:
+            pass
+
+        await _safe_ephemeral(interaction, "❌ Rejeitado.")
 
 # =========================
 # COMANDOS (LIGAR / IBAN)
