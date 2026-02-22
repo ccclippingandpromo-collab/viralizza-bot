@@ -34,7 +34,7 @@ VERIFICADO_ROLE_ID = 1473886534439538699
 
 ADMIN_USER_ID = 1376499031890460714
 
-
+SUPORTE_STAFF_CHANNEL_ID = 1474938549181874320
 
 DB_PATH = "database.sqlite3"
 
@@ -52,11 +52,369 @@ intents.message_content = True
 
 intents.members = True
 
+intents.messages = True
 
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ========= DB =========
 
+def init_support_db():
+
+    conn = sqlite3.connect("viralizzaa.db")
+
+    cur = conn.cursor()
+
+    cur.execute("""
+
+        CREATE TABLE IF NOT EXISTS support_tickets (
+
+            thread_id INTEGER PRIMARY KEY,
+
+            user_id INTEGER NOT NULL,
+
+            status TEXT NOT NULL DEFAULT 'open',
+
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+
+        )
+
+    """)
+
+    conn.commit()
+
+    conn.close()
+
+
+
+def set_ticket(thread_id: int, user_id: int):
+
+    conn = sqlite3.connect("viralizzaa.db")
+
+    cur = conn.cursor()
+
+    cur.execute("INSERT OR REPLACE INTO support_tickets(thread_id, user_id, status) VALUES (?, ?, 'open')",
+
+                (thread_id, user_id))
+
+    conn.commit()
+
+    conn.close()
+
+
+
+def get_open_thread_for_user(user_id: int):
+
+    conn = sqlite3.connect("viralizzaa.db")
+
+    cur = conn.cursor()
+
+    cur.execute("""
+
+        SELECT thread_id FROM support_tickets
+
+        WHERE user_id=? AND status='open'
+
+        ORDER BY created_at DESC LIMIT 1
+
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    return int(row[0]) if row else None
+
+
+
+def get_user_for_thread(thread_id: int):
+
+    conn = sqlite3.connect("viralizzaa.db")
+
+    cur = conn.cursor()
+
+    cur.execute("SELECT user_id FROM support_tickets WHERE thread_id=? AND status='open'", (thread_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    return int(row[0]) if row else None
+
+
+
+def close_ticket(thread_id: int):
+
+    conn = sqlite3.connect("viralizzaa.db")
+
+    cur = conn.cursor()
+
+    cur.execute("UPDATE support_tickets SET status='closed' WHERE thread_id=?", (thread_id,))
+
+    conn.commit()
+
+    conn.close()
+
+
+
+# ========= Ticket creator =========
+
+async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: str):
+
+    staff_channel = interaction.client.get_channel(SUPORTE_STAFF_CHANNEL_ID)
+
+    if not staff_channel:
+
+        await interaction.response.send_message("❌ Canal de suporte do staff não encontrado.", ephemeral=True)
+
+        return
+
+
+
+    msg = await staff_channel.send(
+
+        f"🎫 **Novo Ticket**\n"
+
+        f"👤 User: {interaction.user.mention} (`{interaction.user.id}`)\n"
+
+        f"🧾 Tipo: **{tipo}**\n\n"
+
+        f"📩 **Mensagem:**\n{conteudo}\n\n"
+
+        f"🟢 Staff: respondam no **thread** abaixo para a resposta voltar ao user."
+
+    )
+
+
+
+    thread = await msg.create_thread(
+
+        name=f"ticket-{interaction.user.name}-{interaction.user.id}",
+
+        auto_archive_duration=1440
+
+    )
+
+
+
+    set_ticket(thread.id, interaction.user.id)
+
+
+
+    # DM ao user com instrução
+
+    try:
+
+        await interaction.user.send(
+
+            "✅ **Ticket aberto com o staff!**\n\n"
+
+            "A partir de agora, responde **aqui por DM** e eu vou encaminhar ao staff.\n"
+
+            "Quando o staff responder, vais receber aqui também.\n\n"
+
+            "⚠️ Se não receberes DMs, abre as DMs do servidor."
+
+        )
+
+    except discord.Forbidden:
+
+        await thread.send("⚠️ Não consegui enviar DM ao user (DMs fechadas).")
+
+
+
+    await interaction.response.send_message(
+
+        "✅ Pedido enviado ao staff! Verifica as tuas DMs para continuar o suporte.",
+
+        ephemeral=True
+
+    )
+
+
+
+    await thread.send("🟢 Ticket aberto. Tudo que o user escrever por DM vai cair aqui. Staff respondam aqui.")
+
+
+
+# ========= Modals =========
+
+class CampanhaModal(Modal, title="Problema sobre campanha"):
+
+    campanha = TextInput(label="Nome da campanha", placeholder="Ex: Campanha AfroBeat", required=True)
+
+    problema = TextInput(label="Qual é o problema?", style=discord.TextStyle.paragraph, required=True)
+
+
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        texto = f"📢 Campanha: {self.campanha}\n⚠️ Problema: {self.problema}"
+
+        await criar_ticket(interaction, "Problema com campanha", texto)
+
+
+
+class DuvidaModal(Modal, title="Dúvidas"):
+
+    duvida = TextInput(label="Escreve a tua dúvida", style=discord.TextStyle.paragraph, required=True)
+
+
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        await criar_ticket(interaction, "Dúvida", str(self.duvida))
+
+
+
+# ========= View (Buttons) =========
+
+class SuporteView(View):
+
+    def __init__(self):
+
+        super().__init__(timeout=None)
+
+
+
+    @discord.ui.button(label="📢 Problema sobre campanha", style=discord.ButtonStyle.danger)
+
+    async def campanha(self, interaction: discord.Interaction, button: Button):
+
+        await interaction.response.send_modal(CampanhaModal())
+
+
+
+    @discord.ui.button(label="❓ Dúvidas", style=discord.ButtonStyle.primary)
+
+    async def duvida(self, interaction: discord.Interaction, button: Button):
+
+        await interaction.response.send_modal(DuvidaModal())
+
+
+
+# ========= Command to post support panel =========
+
+@commands.has_permissions(administrator=True)
+
+@bot.command()
+
+async def painel_suporte(ctx):
+
+    await ctx.send(
+
+        "🆘 **SUPORTE VIRALIZZAA**\n\n"
+
+        "Escolhe uma opção abaixo para falares com o staff:\n"
+
+        "📢 Problema sobre campanha\n"
+
+        "❓ Dúvidas gerais\n\n"
+
+        "✅ As respostas do staff vão chegar por DM.",
+
+        view=SuporteView()
+
+    )
+
+
+
+# ========= Relay (ONE on_message) =========
+
+@bot.event
+
+async def on_message(message: discord.Message):
+
+    if message.author.bot:
+
+        return
+
+
+
+    # 1) User -> staff (DM)
+
+    if isinstance(message.channel, discord.DMChannel):
+
+        thread_id = get_open_thread_for_user(message.author.id)
+
+        if not thread_id:
+
+            await message.channel.send("❌ Não encontrei ticket aberto. Abre um ticket em #💬┃suporte.")
+
+            return
+
+
+
+        thread = bot.get_channel(thread_id)
+
+        if thread is None:
+
+            try:
+
+                thread = await bot.fetch_channel(thread_id)
+
+            except:
+
+                await message.channel.send("❌ Não consegui encontrar o ticket (talvez foi fechado).")
+
+                return
+
+
+
+        await thread.send(f"👤 **{message.author} (DM):**\n{message.content}")
+
+        return
+
+
+
+    # 2) Staff -> user (thread)
+
+    if isinstance(message.channel, discord.Thread):
+
+        user_id = get_user_for_thread(message.channel.id)
+
+        if user_id:
+
+            try:
+
+                user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+
+                await user.send(f"🛠 **Staff:**\n{message.content}")
+
+            except discord.Forbidden:
+
+                await message.channel.send("⚠️ Não consegui enviar DM ao user (DMs fechadas).")
+
+        return
+
+
+
+    await bot.process_commands(message)
+
+
+
+# ========= Close ticket command (use inside thread) =========
+
+@commands.has_permissions(manage_messages=True)
+
+@bot.command()
+
+async def fechar_ticket(ctx):
+
+    if not isinstance(ctx.channel, discord.Thread):
+
+        await ctx.send("❌ Usa este comando dentro do thread do ticket.")
+
+        return
+
+
+
+    close_ticket(ctx.channel.id)
+
+    await ctx.send("🔒 Ticket fechado.")
+
+    await ctx.channel.edit(archived=True, locked=True)
 
 # =========================
 
@@ -997,6 +1355,7 @@ if not TOKEN:
 keep_alive()
 
 bot.run(TOKEN)
+
 
 
 
