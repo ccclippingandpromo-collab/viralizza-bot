@@ -14,6 +14,12 @@ from flask import Flask
 
 
 
+# UI imports (OBRIGATÓRIO para Modal/View/Button/TextInput)
+
+from discord.ui import View, Button, Modal, TextInput
+
+
+
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
 
 print("DISCORD FILE:", getattr(discord, "__file__", "unknown"))
@@ -34,7 +40,11 @@ VERIFICADO_ROLE_ID = 1473886534439538699
 
 ADMIN_USER_ID = 1376499031890460714
 
+
+
 SUPORTE_STAFF_CHANNEL_ID = 1474938549181874320
+
+
 
 DB_PATH = "database.sqlite3"
 
@@ -54,17 +64,59 @@ intents.members = True
 
 intents.messages = True
 
-intents.message_content = True
+
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ========= DB =========
 
-def init_support_db():
 
-    conn = sqlite3.connect("viralizzaa.db")
+# =========================
+
+# "DB" EM MEMÓRIA (pendentes/verificados)
+
+# (reseta ao reiniciar)
+
+# =========================
+
+pending_accounts = {}   # user_id -> {"social":..., "username":..., "code":..., "status":"pending"}
+
+verified_accounts = {}  # user_id -> {"social":..., "username":..., "code":..., "status":"verified"}
+
+
+
+# =========================
+
+# SQLITE (IBAN + SUPORTE no mesmo DB)
+
+# =========================
+
+def init_db():
+
+    conn = sqlite3.connect(DB_PATH)
 
     cur = conn.cursor()
+
+
+
+    # IBAN
+
+    cur.execute("""
+
+        CREATE TABLE IF NOT EXISTS ibans (
+
+            user_id INTEGER PRIMARY KEY,
+
+            iban TEXT NOT NULL,
+
+            updated_at TEXT NOT NULL
+
+        )
+
+    """)
+
+
+
+    # SUPORTE
 
     cur.execute("""
 
@@ -82,379 +134,7 @@ def init_support_db():
 
     """)
 
-    conn.commit()
 
-    conn.close()
-
-
-
-def set_ticket(thread_id: int, user_id: int):
-
-    conn = sqlite3.connect("viralizzaa.db")
-
-    cur = conn.cursor()
-
-    cur.execute("INSERT OR REPLACE INTO support_tickets(thread_id, user_id, status) VALUES (?, ?, 'open')",
-
-                (thread_id, user_id))
-
-    conn.commit()
-
-    conn.close()
-
-
-
-def get_open_thread_for_user(user_id: int):
-
-    conn = sqlite3.connect("viralizzaa.db")
-
-    cur = conn.cursor()
-
-    cur.execute("""
-
-        SELECT thread_id FROM support_tickets
-
-        WHERE user_id=? AND status='open'
-
-        ORDER BY created_at DESC LIMIT 1
-
-    """, (user_id,))
-
-    row = cur.fetchone()
-
-    conn.close()
-
-    return int(row[0]) if row else None
-
-
-
-def get_user_for_thread(thread_id: int):
-
-    conn = sqlite3.connect("viralizzaa.db")
-
-    cur = conn.cursor()
-
-    cur.execute("SELECT user_id FROM support_tickets WHERE thread_id=? AND status='open'", (thread_id,))
-
-    row = cur.fetchone()
-
-    conn.close()
-
-    return int(row[0]) if row else None
-
-
-
-def close_ticket(thread_id: int):
-
-    conn = sqlite3.connect("viralizzaa.db")
-
-    cur = conn.cursor()
-
-    cur.execute("UPDATE support_tickets SET status='closed' WHERE thread_id=?", (thread_id,))
-
-    conn.commit()
-
-    conn.close()
-
-
-
-# ========= Ticket creator =========
-
-async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: str):
-
-    staff_channel = interaction.client.get_channel(SUPORTE_STAFF_CHANNEL_ID)
-
-    if not staff_channel:
-
-        await interaction.response.send_message("❌ Canal de suporte do staff não encontrado.", ephemeral=True)
-
-        return
-
-
-
-    msg = await staff_channel.send(
-
-        f"🎫 **Novo Ticket**\n"
-
-        f"👤 User: {interaction.user.mention} (`{interaction.user.id}`)\n"
-
-        f"🧾 Tipo: **{tipo}**\n\n"
-
-        f"📩 **Mensagem:**\n{conteudo}\n\n"
-
-        f"🟢 Staff: respondam no **thread** abaixo para a resposta voltar ao user."
-
-    )
-
-
-
-    thread = await msg.create_thread(
-
-        name=f"ticket-{interaction.user.name}-{interaction.user.id}",
-
-        auto_archive_duration=1440
-
-    )
-
-
-
-    set_ticket(thread.id, interaction.user.id)
-
-
-
-    # DM ao user com instrução
-
-    try:
-
-        await interaction.user.send(
-
-            "✅ **Ticket aberto com o staff!**\n\n"
-
-            "A partir de agora, responde **aqui por DM** e eu vou encaminhar ao staff.\n"
-
-            "Quando o staff responder, vais receber aqui também.\n\n"
-
-            "⚠️ Se não receberes DMs, abre as DMs do servidor."
-
-        )
-
-    except discord.Forbidden:
-
-        await thread.send("⚠️ Não consegui enviar DM ao user (DMs fechadas).")
-
-
-
-    await interaction.response.send_message(
-
-        "✅ Pedido enviado ao staff! Verifica as tuas DMs para continuar o suporte.",
-
-        ephemeral=True
-
-    )
-
-
-
-    await thread.send("🟢 Ticket aberto. Tudo que o user escrever por DM vai cair aqui. Staff respondam aqui.")
-
-
-
-# ========= Modals =========
-
-class CampanhaModal(Modal, title="Problema sobre campanha"):
-
-    campanha = TextInput(label="Nome da campanha", placeholder="Ex: Campanha AfroBeat", required=True)
-
-    problema = TextInput(label="Qual é o problema?", style=discord.TextStyle.paragraph, required=True)
-
-
-
-    async def on_submit(self, interaction: discord.Interaction):
-
-        texto = f"📢 Campanha: {self.campanha}\n⚠️ Problema: {self.problema}"
-
-        await criar_ticket(interaction, "Problema com campanha", texto)
-
-
-
-class DuvidaModal(Modal, title="Dúvidas"):
-
-    duvida = TextInput(label="Escreve a tua dúvida", style=discord.TextStyle.paragraph, required=True)
-
-
-
-    async def on_submit(self, interaction: discord.Interaction):
-
-        await criar_ticket(interaction, "Dúvida", str(self.duvida))
-
-
-
-# ========= View (Buttons) =========
-
-class SuporteView(View):
-
-    def __init__(self):
-
-        super().__init__(timeout=None)
-
-
-
-    @discord.ui.button(label="📢 Problema sobre campanha", style=discord.ButtonStyle.danger)
-
-    async def campanha(self, interaction: discord.Interaction, button: Button):
-
-        await interaction.response.send_modal(CampanhaModal())
-
-
-
-    @discord.ui.button(label="❓ Dúvidas", style=discord.ButtonStyle.primary)
-
-    async def duvida(self, interaction: discord.Interaction, button: Button):
-
-        await interaction.response.send_modal(DuvidaModal())
-
-
-
-# ========= Command to post support panel =========
-
-@commands.has_permissions(administrator=True)
-
-@bot.command()
-
-async def painel_suporte(ctx):
-
-    await ctx.send(
-
-        "🆘 **SUPORTE VIRALIZZAA**\n\n"
-
-        "Escolhe uma opção abaixo para falares com o staff:\n"
-
-        "📢 Problema sobre campanha\n"
-
-        "❓ Dúvidas gerais\n\n"
-
-        "✅ As respostas do staff vão chegar por DM.",
-
-        view=SuporteView()
-
-    )
-
-
-
-# ========= Relay (ONE on_message) =========
-
-@bot.event
-
-async def on_message(message: discord.Message):
-
-    if message.author.bot:
-
-        return
-
-
-
-    # 1) User -> staff (DM)
-
-    if isinstance(message.channel, discord.DMChannel):
-
-        thread_id = get_open_thread_for_user(message.author.id)
-
-        if not thread_id:
-
-            await message.channel.send("❌ Não encontrei ticket aberto. Abre um ticket em #💬┃suporte.")
-
-            return
-
-
-
-        thread = bot.get_channel(thread_id)
-
-        if thread is None:
-
-            try:
-
-                thread = await bot.fetch_channel(thread_id)
-
-            except:
-
-                await message.channel.send("❌ Não consegui encontrar o ticket (talvez foi fechado).")
-
-                return
-
-
-
-        await thread.send(f"👤 **{message.author} (DM):**\n{message.content}")
-
-        return
-
-
-
-    # 2) Staff -> user (thread)
-
-    if isinstance(message.channel, discord.Thread):
-
-        user_id = get_user_for_thread(message.channel.id)
-
-        if user_id:
-
-            try:
-
-                user = bot.get_user(user_id) or await bot.fetch_user(user_id)
-
-                await user.send(f"🛠 **Staff:**\n{message.content}")
-
-            except discord.Forbidden:
-
-                await message.channel.send("⚠️ Não consegui enviar DM ao user (DMs fechadas).")
-
-        return
-
-
-
-    await bot.process_commands(message)
-
-
-
-# ========= Close ticket command (use inside thread) =========
-
-@commands.has_permissions(manage_messages=True)
-
-@bot.command()
-
-async def fechar_ticket(ctx):
-
-    if not isinstance(ctx.channel, discord.Thread):
-
-        await ctx.send("❌ Usa este comando dentro do thread do ticket.")
-
-        return
-
-
-
-    close_ticket(ctx.channel.id)
-
-    await ctx.send("🔒 Ticket fechado.")
-
-    await ctx.channel.edit(archived=True, locked=True)
-
-# =========================
-
-# "DB" EM MEMÓRIA (pendentes/verificados)
-
-# (Isto reseta ao reiniciar — IBAN é que fica persistente no SQLite)
-
-# =========================
-
-pending_accounts = {}   # user_id -> {"social":..., "username":..., "code":..., "status":"pending"}
-
-verified_accounts = {}  # user_id -> {"social":..., "username":..., "code":..., "status":"verified"}
-
-
-
-# =========================
-
-# SQLITE (IBAN PERSISTENTE)
-
-# =========================
-
-def init_db():
-
-    conn = sqlite3.connect(DB_PATH)
-
-    cur = conn.cursor()
-
-    cur.execute("""
-
-        CREATE TABLE IF NOT EXISTS ibans (
-
-            user_id INTEGER PRIMARY KEY,
-
-            iban TEXT NOT NULL,
-
-            updated_at TEXT NOT NULL
-
-        )
-
-    """)
 
     conn.commit()
 
@@ -504,6 +184,88 @@ def get_iban(user_id: int):
 
 
 
+# ====== SUPORTE DB HELPERS ======
+
+def set_ticket(thread_id: int, user_id: int):
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cur = conn.cursor()
+
+    cur.execute(
+
+        "INSERT OR REPLACE INTO support_tickets(thread_id, user_id, status) VALUES (?, ?, 'open')",
+
+        (thread_id, user_id)
+
+    )
+
+    conn.commit()
+
+    conn.close()
+
+
+
+def get_open_thread_for_user(user_id: int):
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cur = conn.cursor()
+
+    cur.execute("""
+
+        SELECT thread_id FROM support_tickets
+
+        WHERE user_id=? AND status='open'
+
+        ORDER BY created_at DESC LIMIT 1
+
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    return int(row[0]) if row else None
+
+
+
+def get_user_for_thread(thread_id: int):
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cur = conn.cursor()
+
+    cur.execute("SELECT user_id FROM support_tickets WHERE thread_id=? AND status='open'", (thread_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    return int(row[0]) if row else None
+
+
+
+def close_ticket(thread_id: int):
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cur = conn.cursor()
+
+    cur.execute("UPDATE support_tickets SET status='closed' WHERE thread_id=?", (thread_id,))
+
+    conn.commit()
+
+    conn.close()
+
+
+
+# =========================
+
+# UTILS
+
+# =========================
+
 def is_verified(member: discord.Member) -> bool:
 
     role = member.guild.get_role(VERIFICADO_ROLE_ID)
@@ -514,7 +276,203 @@ def is_verified(member: discord.Member) -> bool:
 
 # =========================
 
-# MODALS
+# SUPORTE: Ticket creator
+
+# =========================
+
+async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: str):
+
+    staff_channel = interaction.client.get_channel(SUPORTE_STAFF_CHANNEL_ID)
+
+    if not staff_channel:
+
+        await interaction.response.send_message("❌ Canal de suporte do staff não encontrado.", ephemeral=True)
+
+        return
+
+
+
+    # cria mensagem no canal staff
+
+    msg = await staff_channel.send(
+
+        f"🎫 **Novo Ticket**\n"
+
+        f"👤 User: {interaction.user.mention} (`{interaction.user.id}`)\n"
+
+        f"🧾 Tipo: **{tipo}**\n\n"
+
+        f"📩 **Mensagem:**\n{conteudo}\n\n"
+
+        f"🟢 Staff: respondam no **thread** abaixo para a resposta voltar ao user."
+
+    )
+
+
+
+    # cria thread do ticket
+
+    thread = await msg.create_thread(
+
+        name=f"ticket-{interaction.user.name}-{interaction.user.id}",
+
+        auto_archive_duration=1440
+
+    )
+
+
+
+    set_ticket(thread.id, interaction.user.id)
+
+
+
+    # DM ao user com instrução
+
+    try:
+
+        await interaction.user.send(
+
+            "✅ **Ticket aberto com o staff!**\n\n"
+
+            "A partir de agora, responde **aqui por DM** e eu vou encaminhar ao staff.\n"
+
+            "Quando o staff responder, vais receber aqui também.\n\n"
+
+            "⚠️ Se não receberes DMs, ativa: *Server Privacy > Allow Direct Messages*."
+
+        )
+
+    except discord.Forbidden:
+
+        await thread.send("⚠️ Não consegui enviar DM ao user (DMs fechadas).")
+
+
+
+    await interaction.response.send_message(
+
+        "✅ Pedido enviado ao staff! Verifica as tuas DMs para continuar o suporte.",
+
+        ephemeral=True
+
+    )
+
+
+
+    await thread.send("🟢 Ticket aberto. Tudo que o user escrever por DM vai cair aqui. Staff respondam aqui.")
+
+
+
+# =========================
+
+# SUPORTE: Modals
+
+# =========================
+
+class CampanhaModal(Modal, title="Problema sobre campanha"):
+
+    campanha = TextInput(label="Nome da campanha", placeholder="Ex: Campanha AfroBeat", required=True)
+
+    problema = TextInput(label="Qual é o problema?", style=discord.TextStyle.paragraph, required=True)
+
+
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        texto = f"📢 Campanha: {self.campanha}\n⚠️ Problema: {self.problema}"
+
+        await criar_ticket(interaction, "Problema com campanha", texto)
+
+
+
+class DuvidaModal(Modal, title="Dúvidas"):
+
+    duvida = TextInput(label="Escreve a tua dúvida", style=discord.TextStyle.paragraph, required=True)
+
+
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        await criar_ticket(interaction, "Dúvida", str(self.duvida))
+
+
+
+# =========================
+
+# SUPORTE: View com Botões
+
+# =========================
+
+class SuporteView(View):
+
+    def __init__(self):
+
+        super().__init__(timeout=None)
+
+
+
+    @discord.ui.button(label="📢 Problema sobre campanha", style=discord.ButtonStyle.danger, custom_id="support_campaign")
+
+    async def campanha(self, interaction: discord.Interaction, button: Button):
+
+        await interaction.response.send_modal(CampanhaModal())
+
+
+
+    @discord.ui.button(label="❓ Dúvidas", style=discord.ButtonStyle.primary, custom_id="support_question")
+
+    async def duvida(self, interaction: discord.Interaction, button: Button):
+
+        await interaction.response.send_modal(DuvidaModal())
+
+
+
+@commands.has_permissions(administrator=True)
+
+@bot.command()
+
+async def painel_suporte(ctx):
+
+    await ctx.send(
+
+        "🆘 **SUPORTE VIRALIZZAA**\n\n"
+
+        "Escolhe uma opção abaixo para falares com o staff:\n"
+
+        "📢 Problema sobre campanha\n"
+
+        "❓ Dúvidas gerais\n\n"
+
+        "✅ As respostas do staff vão chegar por DM.",
+
+        view=SuporteView()
+
+    )
+
+
+
+@commands.has_permissions(manage_messages=True)
+
+@bot.command()
+
+async def fechar_ticket(ctx):
+
+    if not isinstance(ctx.channel, discord.Thread):
+
+        await ctx.send("❌ Usa este comando dentro do thread do ticket.")
+
+        return
+
+    close_ticket(ctx.channel.id)
+
+    await ctx.send("🔒 Ticket fechado.")
+
+    await ctx.channel.edit(archived=True, locked=True)
+
+
+
+# =========================
+
+# VERIFICAÇÃO: Modal Username
 
 # =========================
 
@@ -530,7 +488,7 @@ class UsernameModal(discord.ui.Modal):
 
 
 
-        self.username = discord.ui.InputText(
+        self.username = discord.ui.TextInput(
 
             label="Coloca o teu username",
 
@@ -568,31 +526,31 @@ class UsernameModal(discord.ui.Modal):
 
         await interaction.response.send_message(
 
-            f"✅ Pedido enviado!\n\n"
+            "✅ Pedido enviado!\n\n"
 
-f"📱 Rede: {self.social}\n"
+            f"📱 Rede: {self.social}\n"
 
-f"👤 Username: {pending_accounts[user_id]['username']}\n"
+            f"👤 Username: {pending_accounts[user_id]['username']}\n"
 
-f"🔑 Código: {self.code}\n\n"
+            f"🔑 Código: {self.code}\n\n"
 
-f"🔒 Isto serve para confirmar que a conta é realmente tua.\n\n"
+            "🔒 Isto serve para confirmar que a conta é realmente tua.\n\n"
 
-f"⚠️ INSTRUÇÕES IMPORTANTES:\n"
+            "⚠️ INSTRUÇÕES IMPORTANTES:\n"
 
-f"1. Vai ao teu perfil do TikTok\n"
+            "1. Vai ao teu perfil do TikTok\n"
 
-f"2. Coloca este código na tua BIO\n"
+            "2. Coloca este código na tua BIO\n"
 
-f"3. Guarda as alterações\n\n"
+            "3. Guarda as alterações\n\n"
 
-f"📌 Exemplo:\n"
+            "📌 Exemplo:\n"
 
-f"Bio: {self.code}\n\n"
+            f"Bio: {self.code}\n\n"
 
-f"⏳ Depois disso, aguarda a aprovação do staff.\n"
+            "⏳ Depois disso, aguarda a aprovação do staff.\n"
 
-f"❗ Não removas o código até seres verificado.",
+            "❗ Não removas o código até seres verificado.",
 
             ephemeral=True
 
@@ -638,6 +596,12 @@ f"❗ Não removas o código até seres verificado.",
 
 
 
+# =========================
+
+# IBAN: Modal
+
+# =========================
+
 class IbanModal(discord.ui.Modal):
 
     def __init__(self):
@@ -661,8 +625,6 @@ class IbanModal(discord.ui.Modal):
 
 
     async def on_submit(self, interaction: discord.Interaction):
-
-        # Só verificados
 
         guild = interaction.guild or bot.get_guild(SERVER_ID)
 
@@ -688,21 +650,13 @@ class IbanModal(discord.ui.Modal):
 
         if not member or not is_verified(member):
 
-            return await interaction.response.send_message(
-
-                "⛔ Tens de estar **Verificado** para guardar IBAN.",
-
-                ephemeral=True,
-
-            )
+            return await interaction.response.send_message("⛔ Tens de estar **Verificado** para guardar IBAN.", ephemeral=True)
 
 
 
         iban_value = str(self.iban.value).strip()
 
         set_iban(interaction.user.id, iban_value)
-
-
 
         await interaction.response.send_message("✅ IBAN guardado com sucesso.", ephemeral=True)
 
@@ -806,8 +760,6 @@ class ViewAccountsButton(discord.ui.Button):
 
         account = verified_accounts.get(interaction.user.id)
 
-
-
         if not account:
 
             msg = "❌ Nenhuma conta verificada ainda."
@@ -826,8 +778,6 @@ class ViewAccountsButton(discord.ui.Button):
 
             )
 
-
-
         await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -836,7 +786,7 @@ class MainView(discord.ui.View):
 
     def __init__(self):
 
-        super().__init__(timeout=None)  # persistente
+        super().__init__(timeout=None)
 
         self.add_item(ConnectButton())
 
@@ -858,15 +808,7 @@ class IbanButtons(discord.ui.View):
 
 
 
-    @discord.ui.button(
-
-        label="Adicionar / Atualizar IBAN",
-
-        style=discord.ButtonStyle.primary,
-
-        custom_id="iban_add",
-
-    )
+    @discord.ui.button(label="Adicionar / Atualizar IBAN", style=discord.ButtonStyle.primary, custom_id="iban_add")
 
     async def add_iban(self, interaction: discord.Interaction, button: discord.ui.Button):
 
@@ -894,13 +836,7 @@ class IbanButtons(discord.ui.View):
 
         if not member or not is_verified(member):
 
-            return await interaction.response.send_message(
-
-                "⛔ Tens de estar **Verificado** para adicionar IBAN.",
-
-                ephemeral=True,
-
-            )
+            return await interaction.response.send_message("⛔ Tens de estar **Verificado** para adicionar IBAN.", ephemeral=True)
 
 
 
@@ -908,15 +844,7 @@ class IbanButtons(discord.ui.View):
 
 
 
-    @discord.ui.button(
-
-        label="Ver meu IBAN",
-
-        style=discord.ButtonStyle.secondary,
-
-        custom_id="iban_view",
-
-    )
+    @discord.ui.button(label="Ver meu IBAN", style=discord.ButtonStyle.secondary, custom_id="iban_view")
 
     async def view_iban(self, interaction: discord.Interaction, button: discord.ui.Button):
 
@@ -944,13 +872,7 @@ class IbanButtons(discord.ui.View):
 
         if not member or not is_verified(member):
 
-            return await interaction.response.send_message(
-
-                "⛔ Tens de estar **Verificado** para ver IBAN.",
-
-                ephemeral=True,
-
-            )
+            return await interaction.response.send_message("⛔ Tens de estar **Verificado** para ver IBAN.", ephemeral=True)
 
 
 
@@ -964,13 +886,7 @@ class IbanButtons(discord.ui.View):
 
         iban, updated_at = row
 
-        await interaction.response.send_message(
-
-            f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}",
-
-            ephemeral=True,
-
-        )
+        await interaction.response.send_message(f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}", ephemeral=True)
 
 
 
@@ -1090,8 +1006,6 @@ class ApprovalView(discord.ui.View):
 
 
 
-        # DM ao user + manda os botões de IBAN
-
         try:
 
             await member.send(
@@ -1176,13 +1090,7 @@ class ApprovalView(discord.ui.View):
 
             try:
 
-                await member.send(
-
-                    "❌ **Verificação rejeitada.**\n"
-
-                    "Confere se o username está certo e tenta novamente."
-
-                )
+                await member.send("❌ **Verificação rejeitada.**\nConfere se o username está certo e tenta novamente.")
 
             except:
 
@@ -1234,8 +1142,6 @@ async def ligar(ctx):
 
 async def ibanpanel(ctx):
 
-    """Opcional: manda o painel do IBAN no servidor (mas só verificados vão conseguir usar)."""
-
     if ctx.guild and ctx.guild.id != SERVER_ID:
 
         return
@@ -1248,19 +1154,13 @@ async def ibanpanel(ctx):
 
 async def iban(ctx, member: discord.Member = None):
 
-    """Admin: ver IBAN de alguém com !iban @user"""
-
     if ctx.author.id != ADMIN_USER_ID:
 
         return await ctx.send("⛔ Só o admin pode usar este comando.")
 
-
-
     if member is None:
 
         return await ctx.send("Usa: `!iban @user`")
-
-
 
     row = get_iban(member.id)
 
@@ -1268,11 +1168,87 @@ async def iban(ctx, member: discord.Member = None):
 
         return await ctx.send(f"❌ {member.mention} não tem IBAN guardado.")
 
-
-
     iban_value, updated_at = row
 
     await ctx.send(f"🏦 IBAN de {member.mention}: **{iban_value}** | 🕒 {updated_at}")
+
+
+
+# =========================
+
+# RELAY (UM on_message apenas)
+
+# =========================
+
+@bot.event
+
+async def on_message(message: discord.Message):
+
+    if message.author.bot:
+
+        return
+
+
+
+    # 1) User -> staff (DM)
+
+    if isinstance(message.channel, discord.DMChannel):
+
+        thread_id = get_open_thread_for_user(message.author.id)
+
+        if not thread_id:
+
+            await message.channel.send("❌ Não encontrei ticket aberto. Abre um ticket em #💬┃suporte.")
+
+            return
+
+
+
+        thread = bot.get_channel(thread_id)
+
+        if thread is None:
+
+            try:
+
+                thread = await bot.fetch_channel(thread_id)
+
+            except:
+
+                await message.channel.send("❌ Não consegui encontrar o ticket (talvez foi fechado).")
+
+                return
+
+
+
+        await thread.send(f"👤 **{message.author} (DM):**\n{message.content}")
+
+        return
+
+
+
+    # 2) Staff -> user (thread)
+
+    if isinstance(message.channel, discord.Thread):
+
+        user_id = get_user_for_thread(message.channel.id)
+
+        if user_id:
+
+            try:
+
+                user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+
+                await user.send(f"🛠 **Staff:**\n{message.content}")
+
+            except discord.Forbidden:
+
+                await message.channel.send("⚠️ Não consegui enviar DM ao user (DMs fechadas).")
+
+        return
+
+
+
+    await bot.process_commands(message)
 
 
 
@@ -1286,7 +1262,7 @@ async def iban(ctx, member: discord.Member = None):
 
 async def on_ready():
 
-    init_db()
+    init_db()  # cria tabelas IBAN + SUPPORT
 
 
 
@@ -1295,6 +1271,8 @@ async def on_ready():
         bot.add_view(MainView())
 
         bot.add_view(IbanButtons())
+
+        bot.add_view(SuporteView())  # <- importante: view persistente do suporte
 
         bot._views_added = True
 
@@ -1306,7 +1284,7 @@ async def on_ready():
 
 # =========================
 
-# WEB (Railway)
+# WEB (keep alive)
 
 # =========================
 
@@ -1348,14 +1326,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
 
-    raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável DISCORD_TOKEN na Railway.")
+    raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável DISCORD_TOKEN no Render/Railway.")
 
 
 
 keep_alive()
 
 bot.run(TOKEN)
-
-
-
-
