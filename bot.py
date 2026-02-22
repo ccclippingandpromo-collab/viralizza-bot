@@ -210,15 +210,31 @@ class UsernameModal(discord.ui.Modal):
 
         await interaction.response.send_message(
 
-            f"✅ Pedido enviado!\n"
+            f"✅ Pedido enviado!\n\n"
 
-            f"**Rede:** {self.social}\n"
+f"📱 Rede: {self.social}\n"
 
-            f"**Username:** {pending_accounts[user_id]['username']}\n"
+f"👤 Username: {pending_accounts[user_id]['username']}\n"
 
-            f"**Código:** `{self.code}`\n\n"
+f"🔑 Código: {self.code}\n\n"
 
-            f"⏳ Agora aguarda a aprovação do staff.",
+f"🔒 Isto serve para confirmar que a conta é realmente tua.\n\n"
+
+f"⚠️ INSTRUÇÕES IMPORTANTES:\n"
+
+f"1. Vai ao teu perfil do TikTok\n"
+
+f"2. Coloca este código na tua BIO\n"
+
+f"3. Guarda as alterações\n\n"
+
+f"📌 Exemplo:\n"
+
+f"Bio: {self.code}\n\n"
+
+f"⏳ Depois disso, aguarda a aprovação do staff.\n"
+
+f"❗ Não removas o código até seres verificado.",
 
             ephemeral=True
 
@@ -981,5 +997,6 @@ if not TOKEN:
 keep_alive()
 
 bot.run(TOKEN)
+
 
 
