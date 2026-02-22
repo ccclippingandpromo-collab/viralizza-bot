@@ -239,21 +239,27 @@ class SuporteView(discord.ui.View):
 
     # ⚠️ AQUI ESTÁ O FIX CRÍTICO:
     # No teu ambiente, o callback está a ser chamado como callback(button, interaction)
-    @discord.ui.button(
-        label="📢 Problema sobre campanha",
-        style=discord.ButtonStyle.danger,
-        custom_id="support_btn_campaign"
-    )
-    async def btn_campaign(self, button: discord.ui.Button, interaction: discord.Interaction):
+   @discord.ui.button(label="📢 Problema sobre campanha", style=discord.ButtonStyle.danger, custom_id="support_btn_campaign")
+async def btn_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
+    try:
         await interaction.response.send_modal(CampanhaModal())
+    except Exception as e:
+        print("ERRO BTN CAMPANHA:", repr(e))
+        if interaction.response.is_done():
+            await interaction.followup.send(f"❌ Erro ao abrir modal: {e}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ Erro ao abrir modal: {e}", ephemeral=True)
 
-    @discord.ui.button(
-        label="❓ Dúvidas",
-        style=discord.ButtonStyle.primary,
-        custom_id="support_btn_question"
-    )
-    async def btn_question(self, button: discord.ui.Button, interaction: discord.Interaction):
+@discord.ui.button(label="❓ Dúvidas", style=discord.ButtonStyle.primary, custom_id="support_btn_question")
+async def btn_question(self, interaction: discord.Interaction, button: discord.ui.Button):
+    try:
         await interaction.response.send_modal(DuvidaModal())
+    except Exception as e:
+        print("ERRO BTN DUVIDA:", repr(e))
+        if interaction.response.is_done():
+            await interaction.followup.send(f"❌ Erro ao abrir modal: {e}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ Erro ao abrir modal: {e}", ephemeral=True)
 
 @commands.has_permissions(administrator=True)
 @bot.command()
@@ -684,3 +690,4 @@ if not TOKEN:
 
 keep_alive()
 bot.run(TOKEN)
+
