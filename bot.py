@@ -392,6 +392,8 @@ class CampanhaModal(discord.ui.Modal):
 
         super().__init__(title="Problema sobre campanha")
 
+
+
         self.campanha = discord.ui.TextInput(
 
             label="Nome da campanha",
@@ -416,6 +418,8 @@ class CampanhaModal(discord.ui.Modal):
 
         )
 
+
+
         self.add_item(self.campanha)
 
         self.add_item(self.problema)
@@ -430,11 +434,15 @@ class CampanhaModal(discord.ui.Modal):
 
 
 
+
+
 class DuvidaModal(discord.ui.Modal):
 
     def __init__(self):
 
         super().__init__(title="Dúvidas")
+
+
 
         self.duvida = discord.ui.TextInput(
 
@@ -448,6 +456,8 @@ class DuvidaModal(discord.ui.Modal):
 
         )
 
+
+
         self.add_item(self.duvida)
 
 
@@ -455,6 +465,8 @@ class DuvidaModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
 
         await criar_ticket(interaction, "Dúvida", self.duvida.value)
+
+
 
 
 
@@ -472,11 +484,11 @@ class SuporteView(discord.ui.View):
 
         style=discord.ButtonStyle.danger,
 
-        custom_id="support_campaign_btn"
+        custom_id="support_btn_campaign"
 
     )
 
-    async def campanha(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
 
         await interaction.response.send_modal(CampanhaModal())
 
@@ -488,13 +500,15 @@ class SuporteView(discord.ui.View):
 
         style=discord.ButtonStyle.primary,
 
-        custom_id="support_question_btn"
+        custom_id="support_btn_question"
 
     )
 
-    async def duvida(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_question(self, interaction: discord.Interaction, button: discord.ui.Button):
 
         await interaction.response.send_modal(DuvidaModal())
+
+
 
 
 
@@ -1357,3 +1371,4 @@ if not TOKEN:
 keep_alive()
 
 bot.run(TOKEN)
+
