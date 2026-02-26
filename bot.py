@@ -1,7 +1,6 @@
 import os
 import re
 import time
-import math
 import sqlite3
 import threading
 import asyncio
@@ -36,13 +35,11 @@ ADMIN_USER_ID = 1376499031890460714
 
 DB_PATH = "database.sqlite3"
 
-# ====== TikTok Views Provider (recomendado: Apify) ======
-# Mete isto nas env vars (Render/Railway):
-# APIFY_TOKEN=xxxxxxxx
-APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+# ====== TikTok Views Provider (Apify) ======
+APIFY_TOKEN = os.getenv("APIFY_TOKEN") # opcional
 APIFY_ACTOR = os.getenv("APIFY_ACTOR", "clockworks/tiktok-scraper")
 
-# Onde cai aprovação/rejeição de vídeos (vamos usar o teu canal de verificações por enquanto)
+# Onde cai aprovação/rejeição de vídeos (vamos usar o canal de verificações por enquanto)
 CAMPANHAS_APROVACAO_CHANNEL_ID = VERIFICACOES_CHANNEL_ID
 
 # =========================
@@ -51,7 +48,7 @@ CAMPANHAS_APROVACAO_CHANNEL_ID = VERIFICACOES_CHANNEL_ID
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.messages = True # relay DM / threads
+intents.messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -64,7 +61,7 @@ verified_accounts = {} # user_id -> {"social":..., "username":..., "code":..., "
 # =========================
 # HELPERS: Compatibilidade de callback (ordem Interaction/Button)
 # =========================
-def _get_interaction(a, b) -> discord.Interaction | None:
+def _get_interaction(a, b):
 if isinstance(a, discord.Interaction):
 return a
 if isinstance(b, discord.Interaction):
@@ -102,6 +99,7 @@ def init_db():
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
 
+# IBANS
 cur.execute("""
 CREATE TABLE IF NOT EXISTS ibans (
 user_id INTEGER PRIMARY KEY,
@@ -110,6 +108,7 @@ updated_at TEXT NOT NULL
 )
 """)
 
+# SUPORTE
 cur.execute("""
 CREATE TABLE IF NOT EXISTS support_tickets (
 thread_id INTEGER PRIMARY KEY,
@@ -119,9 +118,7 @@ created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )
 """)
 
-# =========================
-# CAMPANHAS (TEMPLATE)
-# =========================
+# CAMPANHAS
 cur.execute("""
 CREATE TABLE IF NOT EXISTS campaigns (
 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,7 +280,7 @@ TREEZY_TEST_CAMPAIGN = {
 def db_conn():
 return sqlite3.connect(DB_PATH)
 
-def tiktok_extract_video_id(url: str) -> str | None:
+def tiktok_extract_video_id(url: str):
 m = re.search(r"/video/(\d+)", url)
 if m:
 return m.group(1)
@@ -301,15 +298,13 @@ f"👇 Clica no botão para aderir"
 
 def details_channel_text(c):
 est_views = int(c["budget_total_kz"] / c["rate_kz_per_1k"] * 1000)
-max_pay = c["max_payout_user_kz"]
-max_posts = c["max_posts_total"]
 return (
 f"📊 **Plataformas:** {c['platforms']}\n\n"
 f"🎥 **Tipo:** {c['content_types'].replace(',', ', ')}\n\n"
 f"💸 **Taxa:** {c['rate_kz_per_1k']} Kz / 1000 visualizações\n\n"
 f"💰 **Budget:** {c['budget_total_kz']:,} Kz (≈ {est_views:,} views)\n"
-f"🧾 **Pagamento máximo por pessoa:** {max_pay:,} Kz\n"
-f"📦 **Nº máximo de posts (campanha):** {max_posts}\n"
+f"🧾 **Pagamento máximo por pessoa:** {c['max_payout_user_kz']:,} Kz\n"
+f"📦 **Nº máximo de posts (campanha):** {c['max_posts_total']}\n"
 )
 
 def requirements_text(c):
@@ -358,6 +353,7 @@ if not row:
 return False, "Campanha não encontrada."
 
 budget_total, spent_kz, max_posts_total, max_user_kz, rate, status = row
+
 if status != "active" or spent_kz >= budget_total:
 return False, "Campanha já terminou (budget esgotado)."
 
@@ -459,6 +455,7 @@ row = cur.fetchone()
 if not row:
 conn.close()
 return
+
 name, bt, sk, status, lb_ch_id, lb_msg_id = row
 if not lb_ch_id or not lb_msg_id:
 conn.close()
@@ -473,13 +470,14 @@ ORDER BY v DESC
 LIMIT 10
 """, (campaign_id,))
 top = cur.fetchall()
+conn.close()
 
 pct = 0 if bt == 0 else int((sk / bt) * 100)
 lines = [f"🏆 **LEADERBOARD — {name}**\n"]
+if top:
 for i, (uid, v) in enumerate(top, start=1):
 lines.append(f"{i}. <@{uid}> — **{int(v):,}** views")
-
-if len(top) == 0:
+else:
 lines.append("*(ainda sem vídeos aprovados)*")
 
 lines.append("\n📊 **Progresso da campanha:**")
@@ -488,7 +486,6 @@ if status != "active":
 lines.append("\n🔒 **Campanha encerrada.**")
 
 text = "\n".join(lines)
-conn.close()
 
 lb_ch = guild.get_channel(int(lb_ch_id))
 if not lb_ch:
@@ -502,7 +499,7 @@ pass
 # =========================
 # TikTok views via Apify (MVP)
 # =========================
-async def fetch_tiktok_views_apify(session: aiohttp.ClientSession, url: str) -> int | None:
+async def fetch_tiktok_views_apify(session: aiohttp.ClientSession, url: str):
 if not APIFY_TOKEN:
 return None
 
@@ -525,7 +522,7 @@ return None
 
 status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
 st = None
-for _ in range(12): # até ~60s
+for _ in range(12):
 async with session.get(status_url, timeout=30) as r:
 if r.status >= 300:
 return None
@@ -552,22 +549,18 @@ if not items:
 return None
 
 item = items[0]
-
-# tenta campos comuns
-candidates = []
 if isinstance(item, dict):
 if isinstance(item.get("playCount"), (int, float)):
-candidates.append(int(item["playCount"]))
+return int(item["playCount"])
 stats = item.get("stats") or item.get("statistics")
 if isinstance(stats, dict) and isinstance(stats.get("playCount"), (int, float)):
-candidates.append(int(stats["playCount"]))
+return int(stats["playCount"])
 if isinstance(stats, dict) and isinstance(stats.get("play_count"), (int, float)):
-candidates.append(int(stats["play_count"]))
-
-return candidates[0] if candidates else None
+return int(stats["play_count"])
+return None
 
 # =========================
-# CAMPANHAS: UI (aderir / submeter / aprovar)
+# CAMPANHAS: UI (submeter / aprovar / aderir)
 # =========================
 class SubmitVideoModal(discord.ui.Modal):
 def __init__(self, campaign_id: int):
@@ -592,8 +585,7 @@ row = get_campaign_by_id(conn, self.campaign_id)
 if not row:
 conn.close()
 return await _safe_ephemeral(interaction, "❌ Campanha não encontrada.")
-status = row[11]
-if status != "active":
+if row[11] != "active":
 conn.close()
 return await _safe_ephemeral(interaction, "⚠️ Esta campanha já terminou.")
 
@@ -612,7 +604,6 @@ except sqlite3.IntegrityError:
 conn.close()
 return await _safe_ephemeral(interaction, "⚠️ Este vídeo já foi submetido nesta campanha.")
 
-# mandar para canal de aprovação
 appr = guild.get_channel(CAMPANHAS_APROVACAO_CHANNEL_ID) if guild else None
 if appr:
 view = VideoApprovalView(
@@ -637,22 +628,14 @@ def __init__(self, campaign_id: int):
 super().__init__(timeout=None)
 self.campaign_id = campaign_id
 
-@discord.ui.button(
-label="📥 Submeter vídeo",
-style=discord.ButtonStyle.primary,
-custom_id="camp_submit_video"
-)
+@discord.ui.button(label="📥 Submeter vídeo", style=discord.ButtonStyle.primary, custom_id="camp_submit_video")
 async def submit(self, a, b):
 interaction, _ = _safe_button_pair(a, b)
 if not interaction:
 return
 await interaction.response.send_modal(SubmitVideoModal(self.campaign_id))
 
-@discord.ui.button(
-label="📊 Ver estatísticas",
-style=discord.ButtonStyle.secondary,
-custom_id="camp_view_stats"
-)
+@discord.ui.button(label="📊 Ver estatísticas", style=discord.ButtonStyle.secondary, custom_id="camp_view_stats")
 async def stats(self, a, b):
 interaction, _ = _safe_button_pair(a, b)
 if not interaction:
@@ -660,6 +643,7 @@ return
 
 conn = db_conn()
 cur = conn.cursor()
+
 cur.execute("""
 SELECT COUNT(*), COALESCE(SUM(views_current),0), COALESCE(SUM(paid_views),0)
 FROM submissions
@@ -675,10 +659,10 @@ row = cur.fetchone()
 paid_kz = row[0] if row else 0
 
 cur.execute("""
-SELECT budget_total_kz, spent_kz, rate_kz_per_1k, max_payout_user_kz, status
+SELECT budget_total_kz, spent_kz, max_payout_user_kz, status
 FROM campaigns WHERE id=?
 """, (self.campaign_id,))
-bt, sk, rate, mx, st = cur.fetchone()
+bt, sk, mx, st = cur.fetchone()
 conn.close()
 
 await _safe_ephemeral(
@@ -699,7 +683,7 @@ self.campaign_id = campaign_id
 self.submitter_id = submitter_id
 self.tiktok_url = tiktok_url
 
-async def _only_admin(self, interaction: discord.Interaction) -> bool:
+async def _only_admin(self, interaction: discord.Interaction):
 if interaction.user.id != ADMIN_USER_ID:
 await _safe_ephemeral(interaction, "⛔ Só o admin pode aprovar/rejeitar.")
 return False
@@ -812,7 +796,6 @@ if status != "active":
 conn.close()
 return await _safe_ephemeral(interaction, "⚠️ Esta campanha já terminou.")
 
-# cria estrutura 1 vez
 if not category_id:
 overwrites = {
 guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -865,7 +848,6 @@ await _safe_ephemeral(interaction, "✅ Aderiste à campanha! Vai à categoria d
 # =========================
 @tasks.loop(minutes=15)
 async def track_campaign_views_loop():
-# Se não tiver APIFY_TOKEN, não crasha — só não atualiza
 if not APIFY_TOKEN:
 return
 
@@ -876,11 +858,9 @@ return
 conn = db_conn()
 cur = conn.cursor()
 
-# campanhas ativas
 cur.execute("SELECT id FROM campaigns WHERE status='active'")
 active_campaigns = {int(r[0]) for r in cur.fetchall()}
 
-# submissions aprovadas
 cur.execute("""
 SELECT id, campaign_id, tiktok_url
 FROM submissions
@@ -945,7 +925,6 @@ return
 
 set_ticket(thread.id, interaction.user.id)
 
-# DM ao user
 try:
 await interaction.user.send(
 "✅ **Ticket aberto com o staff!**\n\n"
@@ -989,7 +968,6 @@ await criar_ticket(interaction, "Problema com campanha", texto)
 class DuvidaModal(discord.ui.Modal):
 def __init__(self):
 super().__init__(title="Dúvidas")
-
 self.duvida = discord.ui.TextInput(
 label="Escreve a tua dúvida",
 style=discord.TextStyle.paragraph,
@@ -1005,22 +983,14 @@ class SuporteView(discord.ui.View):
 def __init__(self):
 super().__init__(timeout=None)
 
-@discord.ui.button(
-label="📢 Problema sobre campanha",
-style=discord.ButtonStyle.danger,
-custom_id="support_btn_campaign"
-)
+@discord.ui.button(label="📢 Problema sobre campanha", style=discord.ButtonStyle.danger, custom_id="support_btn_campaign")
 async def btn_campaign(self, a, b):
 interaction, _ = _safe_button_pair(a, b)
 if not interaction:
 return
 await interaction.response.send_modal(CampanhaModal())
 
-@discord.ui.button(
-label="❓ Dúvidas",
-style=discord.ButtonStyle.primary,
-custom_id="support_btn_question"
-)
+@discord.ui.button(label="❓ Dúvidas", style=discord.ButtonStyle.primary, custom_id="support_btn_question")
 async def btn_question(self, a, b):
 interaction, _ = _safe_button_pair(a, b)
 if not interaction:
@@ -1247,7 +1217,7 @@ def __init__(self, target_user_id: int):
 super().__init__(timeout=None)
 self.target_user_id = target_user_id
 
-async def _only_admin(self, interaction: discord.Interaction) -> bool:
+async def _only_admin(self, interaction: discord.Interaction):
 if interaction.user.id != ADMIN_USER_ID:
 await _safe_ephemeral(interaction, "⛔ Só o admin pode aprovar/rejeitar.")
 return False
@@ -1290,7 +1260,6 @@ data["status"] = "verified"
 verified_accounts[self.target_user_id] = data
 pending_accounts.pop(self.target_user_id, None)
 
-# DM com painel IBAN
 try:
 await member.send(
 "✅ **Verificação aprovada!**\n"
@@ -1389,7 +1358,6 @@ await ctx.send(f"🏦 IBAN de {member.mention}: **{iban_value}** | 🕒 {updated
 @commands.has_permissions(administrator=True)
 @bot.command()
 async def campaign_test(ctx):
-"""Cria e publica a campanha teste Treezy."""
 if ctx.guild and ctx.guild.id != SERVER_ID:
 return
 
@@ -1418,7 +1386,7 @@ if not ch:
 return await ctx.send("❌ Canal de campanhas não encontrado.")
 
 if not post_msg_id:
-msg = await ch.send(campaign_post_text(c), view=JoinCampaignView(campaign_slug=c["slug"]))
+msg = await ch.send(campaign_post_text(c), view=JoinCampaignView(c["slug"]))
 conn2 = db_conn()
 cur2 = conn2.cursor()
 cur2.execute("UPDATE campaigns SET post_message_id=? WHERE slug=?", (msg.id, c["slug"]))
@@ -1465,7 +1433,6 @@ max_user_kz, max_posts_total, status,
 campaigns_channel_id, post_message_id,
 category_id, details_id, req_id, submit_id, lb_id, lb_msg_id) = row
 
-# apagar categoria/canais
 try:
 if category_id:
 cat = guild.get_channel(int(category_id))
@@ -1479,7 +1446,6 @@ await cat.delete()
 except:
 pass
 
-# apagar post no canal campanhas
 try:
 if campaigns_channel_id and post_message_id:
 ch = guild.get_channel(int(campaigns_channel_id))
@@ -1538,7 +1504,7 @@ return
 await bot.process_commands(message)
 
 # =========================
-# READY (registrar views persistentes + loop)
+# READY (views persistentes + loop)
 # =========================
 @bot.event
 async def on_ready():
@@ -1548,17 +1514,14 @@ if not getattr(bot, "_views_added", False):
 bot.add_view(MainView())
 bot.add_view(IbanButtons())
 bot.add_view(SuporteView())
-
-# View do botão "Aderir" (campanha teste) — para persistência
 bot.add_view(JoinCampaignView(TREEZY_TEST_CAMPAIGN["slug"]))
-
 bot._views_added = True
 
-if not track_campaign_views_loop.is_running():
+if APIFY_TOKEN and (not track_campaign_views_loop.is_running()):
 track_campaign_views_loop.start()
 
 if not APIFY_TOKEN:
-print("⚠️ APIFY_TOKEN não definido — tracking de views NÃO vai atualizar.")
+print("⚠️ APIFY_TOKEN não definido — tracking de views NÃO vai atualizar (mas o bot funciona).")
 else:
 print("✅ APIFY_TOKEN OK — tracking de views ativo.")
 
