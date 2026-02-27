@@ -271,14 +271,6 @@ def get_iban(user_id: int):
     return row
 
 
-def delete_iban(user_id: int):
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM ibans WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
 # ===== SUPORTE HELPERS =====
 def set_ticket(thread_id: int, user_id: int):
     conn = db_conn()
@@ -291,19 +283,6 @@ def set_ticket(thread_id: int, user_id: int):
     conn.close()
 
 
-def get_open_thread_for_user(user_id: int):
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT thread_id FROM support_tickets
-    WHERE user_id=? AND status='open'
-    ORDER BY created_at DESC LIMIT 1
-    """, (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else None
-
-
 def get_user_for_thread(thread_id: int):
     conn = db_conn()
     cur = conn.cursor()
@@ -311,14 +290,6 @@ def get_user_for_thread(thread_id: int):
     row = cur.fetchone()
     conn.close()
     return int(row[0]) if row else None
-
-
-def close_ticket(thread_id: int):
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE support_tickets SET status='closed' WHERE thread_id=?", (thread_id,))
-    conn.commit()
-    conn.close()
 
 
 # ===== VERIFICAÇÃO HELPERS =====
@@ -372,14 +343,6 @@ def set_verification_status(user_id: int, status: str):
     SET status=?, updated_at=?
     WHERE user_id=?
     """, (status, _now(), user_id))
-    conn.commit()
-    conn.close()
-
-
-def delete_verification_request(user_id: int):
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM verification_requests WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -703,7 +666,7 @@ async def fetch_tiktok_views_apify(session: aiohttp.ClientSession, url: str):
 
 
 # =========================
-# CAMPANHAS: UI (SUBMIT)
+# CAMPANHAS: UI (SUBMIT) — BOTÕES FUNCIONAIS ✅
 # =========================
 class SubmitVideoModal(discord.ui.Modal):
     def __init__(self, campaign_id: int):
@@ -736,7 +699,6 @@ class SubmitVideoModal(discord.ui.Modal):
             return await _safe_ephemeral(interaction, "⚠️ Esta campanha já terminou.")
 
         url = str(self.url.value).strip()
-
         if not url.startswith("http://") and not url.startswith("https://"):
             conn.close()
             return await _safe_ephemeral(interaction, "❌ Link inválido. Envia um link completo com **https://**")
@@ -775,57 +737,29 @@ class SubmitVideoModal(discord.ui.Modal):
         await _safe_ephemeral(interaction, "✅ Vídeo submetido! Aguarda aprovação do staff.")
 
 
-class SubmitView(discord.ui.View):
-    """
-    BOTÕES COM custom_id ÚNICO POR CAMPANHA (evita falhas).
-    """
+class SubmitVideoButton(discord.ui.Button):
     def __init__(self, campaign_id: int):
-        super().__init__(timeout=None)
-        self.campaign_id = int(campaign_id)
-
-        self.add_item(discord.ui.Button(
+        super().__init__(
             label="📥 Submeter vídeo",
             style=discord.ButtonStyle.primary,
-            custom_id=f"camp_submit_video_{self.campaign_id}"
-        ))
-        self.add_item(discord.ui.Button(
+            custom_id=f"camp_submit_video_{int(campaign_id)}"
+        )
+        self.campaign_id = int(campaign_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(SubmitVideoModal(self.campaign_id))
+
+
+class ViewStatsButton(discord.ui.Button):
+    def __init__(self, campaign_id: int):
+        super().__init__(
             label="📊 Ver estatísticas",
             style=discord.ButtonStyle.secondary,
-            custom_id=f"camp_view_stats_{self.campaign_id}"
-        ))
+            custom_id=f"camp_view_stats_{int(campaign_id)}"
+        )
+        self.campaign_id = int(campaign_id)
 
-
-@bot.event
-async def on_interaction(interaction: discord.Interaction):
-    """
-    Router para os botões dinâmicos do SubmitView.
-    """
-    if interaction.type != discord.InteractionType.component:
-        return
-
-    custom_id = None
-    try:
-        custom_id = interaction.data.get("custom_id")
-    except:
-        custom_id = None
-
-    if not custom_id:
-        return
-
-    if custom_id.startswith("camp_submit_video_"):
-        try:
-            cid = int(custom_id.split("_")[-1])
-        except:
-            return
-        await interaction.response.send_modal(SubmitVideoModal(cid))
-        return
-
-    if custom_id.startswith("camp_view_stats_"):
-        try:
-            cid = int(custom_id.split("_")[-1])
-        except:
-            return
-
+    async def callback(self, interaction: discord.Interaction):
         conn = db_conn()
         cur = conn.cursor()
 
@@ -833,20 +767,20 @@ async def on_interaction(interaction: discord.Interaction):
         SELECT COUNT(*), COALESCE(SUM(views_current),0), COALESCE(SUM(paid_views),0)
         FROM submissions
         WHERE campaign_id=? AND user_id=? AND status IN ('approved','frozen')
-        """, (cid, interaction.user.id))
+        """, (self.campaign_id, interaction.user.id))
         posts, views, paid_views = cur.fetchone()
 
         cur.execute("""
         SELECT COALESCE(paid_kz,0) FROM campaign_users
         WHERE campaign_id=? AND user_id=?
-        """, (cid, interaction.user.id))
+        """, (self.campaign_id, interaction.user.id))
         row = cur.fetchone()
         paid_kz = row[0] if row else 0
 
         cur.execute("""
         SELECT budget_total_kz, spent_kz, max_payout_user_kz, status
         FROM campaigns WHERE id=?
-        """, (cid,))
+        """, (self.campaign_id,))
         r2 = cur.fetchone()
         conn.close()
 
@@ -857,7 +791,7 @@ async def on_interaction(interaction: discord.Interaction):
 
         await _safe_ephemeral(
             interaction,
-            f"📊 **As tuas stats (campanha {cid})**\n"
+            f"📊 **As tuas stats (campanha {self.campaign_id})**\n"
             f"• Posts aprovados: **{posts}**\n"
             f"• Views atuais somadas: **{views:,}**\n"
             f"• Views já pagas: **{paid_views:,}**\n"
@@ -865,7 +799,14 @@ async def on_interaction(interaction: discord.Interaction):
             f"💰 Campanha: **{sk:,}/{bt:,} Kz**\n"
             f"📌 Estado: **{st}**"
         )
-        return
+
+
+class SubmitView(discord.ui.View):
+    def __init__(self, campaign_id: int):
+        super().__init__(timeout=None)
+        cid = int(campaign_id)
+        self.add_item(SubmitVideoButton(cid))
+        self.add_item(ViewStatsButton(cid))
 
 
 class VideoApprovalView(discord.ui.View):
@@ -964,9 +905,6 @@ class VideoApprovalView(discord.ui.View):
 # CAMPANHAS: JOIN
 # =========================
 class JoinCampaignView(discord.ui.View):
-    """
-    Encontra campanha pelo post_message_id
-    """
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1182,7 +1120,7 @@ async def refreshviews(ctx, campaign_id: int = None):
 
 
 # =========================
-# SUPORTE (mantido igual ao teu)
+# SUPORTE
 # =========================
 async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: str):
     staff_channel = interaction.client.get_channel(SUPORTE_STAFF_CHANNEL_ID)
@@ -1270,7 +1208,7 @@ class SuporteView(discord.ui.View):
 
 
 # =========================
-# VERIFICAÇÃO + IBAN (mantido igual ao teu)
+# VERIFICAÇÃO + IBAN
 # =========================
 class UsernameModal(discord.ui.Modal):
     def __init__(self, social: str, code: str):
@@ -1614,7 +1552,7 @@ async def campanha(ctx):
 
 
 # =========================
-# READY: reattach views
+# READY: reattach views (painéis antigos)
 # =========================
 async def reattach_pending_verification_views():
     guild = bot.get_guild(SERVER_ID)
@@ -1671,9 +1609,9 @@ async def reattach_submit_panels():
             if not submit_ch:
                 continue
             msg = await submit_ch.fetch_message(int(panel_msg_id))
-            await msg.edit(view=SubmitView(int(cid)))
-        except:
-            pass
+            await msg.edit(view=SubmitView(int(cid)))  # <-- aqui “re-regista” os botões
+        except Exception as e:
+            print("⚠️ reattach_submit_panels erro:", e)
 
 
 @bot.event
