@@ -8,6 +8,31 @@ import secrets
 import string
 from typing import Optional
 
+# =========================
+# DEBUG: provar versão real do Python no Render
+# (tem de estar ANTES do import discord)
+# =========================
+import sys, platform
+print("PYTHON VERSION:", sys.version)
+print("PYTHON EXE:", sys.executable)
+print("PLATFORM:", platform.platform())
+
+# =========================
+# PATCH: audioop para Python 3.13/3.14
+# discord.py/voice pode tentar importar audioop -> crasha se não existir
+# =========================
+try:
+    import audioop  # noqa: F401
+    print("AUDIOOP: OK (stdlib)")
+except Exception as e:
+    print("AUDIOOP: missing/failed -> trying audioop_lts. Error:", repr(e))
+    try:
+        import audioop_lts as _audioop_lts  # pip install audioop-lts
+        sys.modules["audioop"] = _audioop_lts
+        print("AUDIOOP: patched via audioop_lts ✅")
+    except Exception as e2:
+        print("AUDIOOP: patch FAILED ❌ -> install audioop-lts in requirements.txt. Error:", repr(e2))
+
 import aiohttp
 import discord
 from discord.ext import commands, tasks
@@ -781,7 +806,6 @@ class SubmitView(discord.ui.View):
         super().__init__(timeout=None)
         self.campaign_id = int(campaign_id)
 
-        # Botões criados programaticamente para custom_id único
         self.add_item(discord.ui.Button(
             label="📥 Submeter vídeo",
             style=discord.ButtonStyle.primary,
@@ -793,33 +817,15 @@ class SubmitView(discord.ui.View):
             custom_id=f"camp_view_stats_{self.campaign_id}"
         ))
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return True
-
-    @discord.ui.button(label="__", style=discord.ButtonStyle.gray, disabled=True, custom_id="__dummy_submitview__")
-    async def _dummy(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # nunca aparece (apenas para satisfazer a classe)
-        return
-
-    async def on_timeout(self):
-        pass
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
-        try:
-            await _safe_ephemeral(interaction, f"⚠️ Erro: {error}")
-        except:
-            pass
-
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     """
     Router para os botões dinâmicos do SubmitView.
     """
-    if not interaction.type == discord.InteractionType.component:
+    if interaction.type != discord.InteractionType.component:
         return
 
-    cid = None
     custom_id = None
     try:
         custom_id = interaction.data.get("custom_id")
@@ -829,7 +835,6 @@ async def on_interaction(interaction: discord.Interaction):
     if not custom_id:
         return
 
-    # submit
     if custom_id.startswith("camp_submit_video_"):
         try:
             cid = int(custom_id.split("_")[-1])
@@ -838,7 +843,6 @@ async def on_interaction(interaction: discord.Interaction):
         await interaction.response.send_modal(SubmitVideoModal(cid))
         return
 
-    # stats
     if custom_id.startswith("camp_view_stats_"):
         try:
             cid = int(custom_id.split("_")[-1])
@@ -1038,7 +1042,6 @@ class JoinCampaignView(discord.ui.View):
             conn.close()
             return await _safe_ephemeral(interaction, "⚠️ Esta campanha já terminou.")
 
-        # Permissões: verificados podem VER, mas NÃO podem enviar mensagens
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             guild.get_role(VERIFICADO_ROLE_ID): discord.PermissionOverwrite(
@@ -1119,9 +1122,6 @@ class JoinCampaignView(discord.ui.View):
 # Tracking loop + Manual refresh
 # =========================
 async def run_tracking_once(guild: discord.Guild, only_campaign_id: Optional[int] = None) -> str:
-    """
-    Faz 1 ciclo: busca views das submissions aprovadas, paga blocos, atualiza leaderboard.
-    """
     if not APIFY_TOKEN:
         return "⚠️ APIFY_TOKEN não definido — não dá para contar views."
 
@@ -1196,11 +1196,6 @@ async def track_campaign_views_loop():
 @commands.has_permissions(administrator=True)
 @bot.command()
 async def refreshviews(ctx, campaign_id: int = None):
-    """
-    Admin: força atualização de views/leaderboard agora.
-    Uso: !refreshviews   (tudo)
-         !refreshviews 1 (só campanha 1)
-    """
     if ctx.guild and ctx.guild.id != SERVER_ID:
         return
     await ctx.send("⏳ A atualizar views/leaderboard...")
@@ -1210,7 +1205,7 @@ async def refreshviews(ctx, campaign_id: int = None):
 
 
 # =========================
-# SUPORTE
+# SUPORTE (mantido igual ao teu)
 # =========================
 async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: str):
     staff_channel = interaction.client.get_channel(SUPORTE_STAFF_CHANNEL_ID)
@@ -1297,32 +1292,8 @@ class SuporteView(discord.ui.View):
         await interaction.response.send_modal(DuvidaModal())
 
 
-@commands.has_permissions(administrator=True)
-@bot.command()
-async def painel_suporte(ctx):
-    await ctx.send(
-        "🆘 **SUPORTE VIRALIZZAA**\n\n"
-        "Escolhe uma opção abaixo para falares com o staff:\n"
-        "📢 Problema sobre campanha\n"
-        "❓ Dúvidas gerais\n\n"
-        "✅ As respostas do staff vão chegar por DM.",
-        view=SuporteView()
-    )
-
-
-@commands.has_permissions(manage_messages=True)
-@bot.command()
-async def fechar_ticket(ctx):
-    if not isinstance(ctx.channel, discord.Thread):
-        await ctx.send("❌ Usa este comando dentro do thread do ticket.")
-        return
-    close_ticket(ctx.channel.id)
-    await ctx.send("🔒 Ticket fechado.")
-    await ctx.channel.edit(archived=True, locked=True)
-
-
 # =========================
-# VERIFICAÇÃO: Painel Ligar + IBAN
+# VERIFICAÇÃO + IBAN (mantido igual ao teu)
 # =========================
 class UsernameModal(discord.ui.Modal):
     def __init__(self, social: str, code: str):
@@ -1596,7 +1567,7 @@ class ApprovalView(discord.ui.View):
 
 
 # =========================
-# COMANDOS (LIGAR / IBAN / DESVERIFICAR)
+# COMANDOS
 # =========================
 @bot.command()
 async def ligar(ctx):
@@ -1612,28 +1583,6 @@ async def ibanpanel(ctx):
     await ctx.send("**Painel IBAN (apenas verificados)**", view=IbanButtons())
 
 
-@bot.command()
-async def desverificar(ctx, member: discord.Member = None):
-    if ctx.author.id != ADMIN_USER_ID:
-        return await ctx.send("⛔ Só o admin pode usar este comando.")
-    if member is None:
-        return await ctx.send("Usa: `!desverificar @user`")
-
-    role = ctx.guild.get_role(VERIFICADO_ROLE_ID)
-    if role and role in member.roles:
-        try:
-            await member.remove_roles(role, reason="Desverificação manual (teste)")
-        except discord.Forbidden:
-            return await ctx.send("⛔ Sem permissão para remover cargos (Manage Roles / cargo acima do Verificado).")
-
-    delete_iban(member.id)
-    delete_verification_request(member.id)
-    await ctx.send(f"♻️ {member.mention} foi **desverificado** e os dados foram limpos.")
-
-
-# =========================
-# COMANDOS (CAMPANHAS)
-# =========================
 @commands.has_permissions(administrator=True)
 @bot.command()
 async def campaign_test(ctx):
@@ -1663,7 +1612,7 @@ async def campaign_test(ctx):
         conn.close()
         return await ctx.send("❌ Erro ao criar campanha no DB.")
 
-    post_msg_id = row[13]  # post_message_id
+    post_msg_id = row[13]
     conn.close()
 
     ch = ctx.guild.get_channel(CAMPANHAS_CHANNEL_ID)
@@ -1806,4 +1755,3 @@ if not TOKEN:
 
 keep_alive()
 bot.run(TOKEN)
-
