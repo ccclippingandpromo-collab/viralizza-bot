@@ -1725,24 +1725,27 @@ def keep_alive():
 # =========================
 # RUN
 # =========================
+import os
+
+# Buscar token corretamente
 TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or "").strip()
+
+# Verificar se existe
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável DISCORD_TOKEN no Render/Railway.")
-
-# DEBUG SEGURO DO TOKEN (NÃO IMPRIME O TOKEN)
-print("TOKEN_LEN:", len(TOKEN))
-print("TOKEN_DOTS:", TOKEN.count("."))
-print("TOKEN_HAS_SPACE:", any(c.isspace() for c in TOKEN))
-print("TOKEN_STARTS_WITH_QUOTES:", TOKEN[:1] in ["'", '"'])
-print("TOKEN_ENDS_WITH_QUOTES:", TOKEN[-1:] in ["'", '"'])
-
-# Se não tiver 2 pontos, não é bot token válido (ou veio cortado/errado)
-if TOKEN.count(".") != 2:
-    raise RuntimeError
-        "Token parece mal-formatado (não tem 2 pontos). "
-        "Vai ao Developer Portal -> Bot -> Reset Token -> Copy e cola no Render."
-
+    raise RuntimeError(
+        "TOKEN do Discord não encontrado. Define DISCORD_TOKEN no Render."
     )
 
+# DEBUG (seguro)
+print("TOKEN_LEN:", len(TOKEN))
+print("TOKEN_DOTS:", TOKEN.count("."))
+
+# Validar formato do token
+if TOKEN.count(".") != 2:
+    raise RuntimeError(
+        "Token inválido. Vai ao Discord Developer Portal -> Bot -> Reset Token -> Copy e cola no Render."
+    )
+
+# Iniciar bot
 keep_alive()
 bot.run(TOKEN)
