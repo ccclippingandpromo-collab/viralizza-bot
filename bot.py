@@ -1342,14 +1342,19 @@ def keep_alive():
 # =========================
 # RUN
 # =========================
-TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
+import os
 
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN não encontrado. Define DISCORD_TOKEN com o BOT TOKEN.")
+raw = os.getenv("DISCORD_TOKEN")
+print("DISCORD_TOKEN raw repr:", repr(raw))
 
-print("TOKEN_LEN:", len(TOKEN))
-print("TOKEN_DOTS:", TOKEN.count("."))
-print("TOKEN_HAS_WHITESPACE:", any(c.isspace() for c in TOKEN))
+if not raw:
+    raise RuntimeError("DISCORD_TOKEN está vazio/None no Render Environment.")
 
-keep_alive()
+TOKEN = raw.strip().strip('"').strip("'")
+
+print("TOKEN len:", len(TOKEN))
+print("TOKEN dots:", TOKEN.count("."))
+print("TOKEN has_whitespace:", any(c.isspace() for c in TOKEN))
+print("TOKEN head/tail:", TOKEN[:8], "...", TOKEN[-8:])
+
 bot.run(TOKEN)
