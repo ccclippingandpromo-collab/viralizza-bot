@@ -8,9 +8,8 @@ import secrets
 import string
 from typing import Optional
 
-import aiohttp
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from flask import Flask
 
 # =========================
@@ -34,20 +33,11 @@ VERIFICADO_ROLE_ID = 1473886534439538699
 ADMIN_USER_ID = 1376499031890460714
 
 # DB
-# DICA: Em Render, mete DB_PATH para um disco persistente (ex: /var/data/database.sqlite3)
 DB_PATH = os.getenv("DB_PATH", "database.sqlite3")
-
-# ====== TikTok Views Provider (Apify) ======
-APIFY_TOKEN = os.getenv("APIFY_TOKEN")  # obrigatório para tracking
-APIFY_ACTOR = os.getenv("APIFY_ACTOR", "clockworks/tiktok-scraper")
-
-# Onde cai aprovação/rejeição de vídeos
-CAMPANHAS_APROVACAO_CHANNEL_ID = VERIFICACOES_CHANNEL_ID
 
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
 print("DISCORD FILE:", getattr(discord, "__file__", "unknown"))
 print("DB_PATH:", DB_PATH)
-print("APIFY_TOKEN set?:", bool(APIFY_TOKEN))
 
 # =========================
 # BOT / INTENTS
@@ -66,7 +56,17 @@ def _now() -> int:
     return int(time.time())
 
 
+def _ensure_db_dir(path: str):
+    try:
+        d = os.path.dirname(path)
+        if d and d not in (".", "./") and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+    except Exception as e:
+        print("⚠️ Não consegui criar pasta do DB:", e)
+
+
 def db_conn():
+    _ensure_db_dir(DB_PATH)
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
@@ -103,8 +103,8 @@ async def _safe_ephemeral(interaction: discord.Interaction, content: str):
             await interaction.followup.send(content, ephemeral=True)
         else:
             await interaction.response.send_message(content, ephemeral=True)
-    except:
-        pass
+    except Exception as e:
+        print("⚠️ _safe_ephemeral falhou:", e)
 
 
 def _get_interaction(a, b):
@@ -283,6 +283,19 @@ def set_ticket(thread_id: int, user_id: int):
     conn.close()
 
 
+def get_open_thread_for_user(user_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT thread_id FROM support_tickets
+    WHERE user_id=? AND status='open'
+    ORDER BY created_at DESC LIMIT 1
+    """, (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else None
+
+
 def get_user_for_thread(thread_id: int):
     conn = db_conn()
     cur = conn.cursor()
@@ -290,6 +303,14 @@ def get_user_for_thread(thread_id: int):
     row = cur.fetchone()
     conn.close()
     return int(row[0]) if row else None
+
+
+def close_ticket(thread_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE support_tickets SET status='closed' WHERE thread_id=?", (thread_id,))
+    conn.commit()
+    conn.close()
 
 
 # ===== VERIFICAÇÃO HELPERS =====
@@ -361,7 +382,7 @@ def list_pending_verifications():
 
 
 # =========================
-# CAMPANHAS
+# CAMPANHAS (BASE)
 # =========================
 TREEZY_TEST_CAMPAIGN = {
     "name": "Treezy Flacko – Kwarran",
@@ -388,12 +409,11 @@ def campaign_post_text(c):
 
 
 def details_channel_text(c):
-    est_views = int(c["budget_total_kz"] / c["rate_kz_per_1k"] * 1000)
     return (
         f"📊 **Plataformas:** {c['platforms']}\n\n"
         f"🎥 **Tipo:** {c['content_types'].replace(',', ', ')}\n\n"
         f"💸 **Taxa:** {c['rate_kz_per_1k']} Kz / 1000 visualizações\n\n"
-        f"💰 **Budget:** {c['budget_total_kz']:,} Kz (≈ {est_views:,} views)\n"
+        f"💰 **Budget:** {c['budget_total_kz']:,} Kz\n"
         f"🧾 **Pagamento máximo por pessoa:** {c['max_payout_user_kz']:,} Kz\n"
         f"📦 **Nº máximo de posts (campanha):** {c['max_posts_total']}\n"
     )
@@ -439,234 +459,8 @@ def get_campaign_by_id(conn, campaign_id: int):
     return cur.fetchone()
 
 
-def can_approve(conn, campaign_id: int, user_id: int):
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT budget_total_kz, spent_kz, max_posts_total, max_payout_user_kz, rate_kz_per_1k, status
-    FROM campaigns WHERE id=?
-    """, (campaign_id,))
-    row = cur.fetchone()
-    if not row:
-        return False, "Campanha não encontrada."
-
-    budget_total, spent_kz, max_posts_total, max_user_kz, rate, status = row
-
-    if status != "active" or spent_kz >= budget_total:
-        return False, "Campanha já terminou (budget esgotado)."
-
-    cur.execute("SELECT COUNT(*) FROM submissions WHERE campaign_id=? AND status='approved'", (campaign_id,))
-    approved_count = cur.fetchone()[0]
-    if approved_count >= max_posts_total:
-        return False, f"Limite atingido: {max_posts_total} vídeos já aprovados nesta campanha."
-
-    cur.execute("SELECT paid_kz FROM campaign_users WHERE campaign_id=? AND user_id=?", (campaign_id, user_id))
-    r2 = cur.fetchone()
-    user_paid = r2[0] if r2 else 0
-    if user_paid >= max_user_kz:
-        return False, "Já atingiste o pagamento máximo nesta campanha."
-
-    return True, "OK"
-
-
-def update_one_submission_payment(conn, submission_id: int):
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT
-        s.id, s.campaign_id, s.user_id, s.views_current, s.paid_views,
-        c.budget_total_kz, c.spent_kz, c.rate_kz_per_1k, c.max_payout_user_kz, c.status,
-        COALESCE(u.paid_kz,0)
-    FROM submissions s
-    JOIN campaigns c ON c.id = s.campaign_id
-    LEFT JOIN campaign_users u ON u.campaign_id=s.campaign_id AND u.user_id=s.user_id
-    WHERE s.id=? AND s.status='approved'
-    """, (submission_id,))
-    row = cur.fetchone()
-    if not row:
-        return
-
-    (sid, cid, uid, views_current, paid_views,
-     budget_total, spent_kz, rate, max_user_kz, status,
-     user_paid_kz) = row
-
-    if status != "active":
-        return
-
-    remaining_campaign = budget_total - spent_kz
-    if remaining_campaign <= 0:
-        cur.execute("UPDATE campaigns SET status='closed' WHERE id=?", (cid,))
-        conn.commit()
-        return
-
-    remaining_user = max_user_kz - user_paid_kz
-    if remaining_user <= 0:
-        cur.execute("UPDATE submissions SET status='frozen' WHERE id=?", (sid,))
-        conn.commit()
-        return
-
-    new_views = max(0, int(views_current) - int(paid_views))
-    blocks = new_views // 1000
-    if blocks <= 0:
-        return
-
-    cap_kz = min(remaining_campaign, remaining_user)
-    max_blocks_by_money = cap_kz // rate
-    blocks_payable = min(blocks, max_blocks_by_money)
-    if blocks_payable <= 0:
-        return
-
-    pay_kz = blocks_payable * rate
-    pay_views = blocks_payable * 1000
-
-    cur.execute("UPDATE submissions SET paid_views = paid_views + ? WHERE id=?", (pay_views, sid))
-
-    cur.execute("""
-    INSERT INTO campaign_users (campaign_id, user_id, paid_kz, total_views_paid)
-    VALUES (?,?,0,0)
-    ON CONFLICT(campaign_id, user_id) DO NOTHING
-    """, (cid, uid))
-
-    cur.execute("""
-    UPDATE campaign_users
-    SET paid_kz = paid_kz + ?, total_views_paid = total_views_paid + ?
-    WHERE campaign_id=? AND user_id=?
-    """, (pay_kz, pay_views, cid, uid))
-
-    cur.execute("UPDATE campaigns SET spent_kz = spent_kz + ? WHERE id=?", (pay_kz, cid))
-
-    cur.execute("SELECT budget_total_kz, spent_kz FROM campaigns WHERE id=?", (cid,))
-    bt, sk = cur.fetchone()
-    if sk >= bt:
-        cur.execute("UPDATE campaigns SET status='closed' WHERE id=?", (cid,))
-
-    conn.commit()
-
-
-async def update_leaderboard_message(guild: discord.Guild, campaign_id: int):
-    conn = db_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-    SELECT name, budget_total_kz, spent_kz, status,
-           leaderboard_channel_id, leaderboard_message_id
-    FROM campaigns WHERE id=?
-    """, (campaign_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return
-
-    name, bt, sk, status, lb_ch_id, lb_msg_id = row
-    if not lb_ch_id or not lb_msg_id:
-        conn.close()
-        return
-
-    cur.execute("""
-    SELECT user_id, COALESCE(SUM(views_current),0) as v
-    FROM submissions
-    WHERE campaign_id=? AND status IN ('approved','frozen')
-    GROUP BY user_id
-    ORDER BY v DESC
-    LIMIT 10
-    """, (campaign_id,))
-    top = cur.fetchall()
-    conn.close()
-
-    pct = 0 if bt == 0 else int((sk / bt) * 100)
-    remaining = max(0, bt - sk)
-
-    lines = [f"🏆 **LEADERBOARD — {name}**\n"]
-    if top:
-        for i, (uid, v) in enumerate(top, start=1):
-            lines.append(f"{i}. <@{uid}> — **{int(v):,}** views")
-    else:
-        lines.append("*(ainda sem vídeos aprovados / sem views atualizadas)*")
-
-    lines.append("\n📊 **Progresso da campanha:**")
-    lines.append(f"**{pct}%** | **{sk:,}/{bt:,} Kz**")
-    lines.append(f"💰 **Budget restante:** **{remaining:,} Kz**")
-
-    if status != "active":
-        lines.append("\n🔒 **Campanha encerrada.**")
-
-    text = "\n".join(lines)
-
-    lb_ch = guild.get_channel(int(lb_ch_id))
-    if not lb_ch:
-        return
-    try:
-        msg = await lb_ch.fetch_message(int(lb_msg_id))
-        await msg.edit(content=text)
-    except:
-        pass
-
-
 # =========================
-# TikTok views via Apify
-# =========================
-async def fetch_tiktok_views_apify(session: aiohttp.ClientSession, url: str):
-    if not APIFY_TOKEN:
-        return None
-
-    run_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/runs?token={APIFY_TOKEN}"
-    payload = {
-        "startUrls": [{"url": url}],
-        "resultsPerPage": 1,
-        "shouldDownloadVideos": False,
-        "shouldDownloadCovers": False,
-        "shouldDownloadSlideshowImages": False,
-    }
-
-    async with session.post(run_url, json=payload, timeout=60) as r:
-        if r.status >= 300:
-            return None
-        data = await r.json()
-        run_id = data.get("data", {}).get("id")
-        if not run_id:
-            return None
-
-    status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
-    st = None
-    for _ in range(12):
-        async with session.get(status_url, timeout=30) as r:
-            if r.status >= 300:
-                return None
-            st = await r.json()
-            status = st.get("data", {}).get("status")
-            if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-                break
-        await asyncio.sleep(5)
-
-    if not st:
-        return None
-
-    dataset_id = st.get("data", {}).get("defaultDatasetId")
-    if not dataset_id:
-        return None
-
-    items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true&limit=1&token={APIFY_TOKEN}"
-    async with session.get(items_url, timeout=60) as r:
-        if r.status >= 300:
-            return None
-        items = await r.json()
-
-    if not items:
-        return None
-
-    item = items[0]
-    if isinstance(item, dict):
-        if isinstance(item.get("playCount"), (int, float)):
-            return int(item["playCount"])
-        stats = item.get("stats") or item.get("statistics")
-        if isinstance(stats, dict) and isinstance(stats.get("playCount"), (int, float)):
-            return int(stats["playCount"])
-        if isinstance(stats, dict) and isinstance(stats.get("play_count"), (int, float)):
-            return int(stats["play_count"])
-
-    return None
-
-
-# =========================
-# CAMPANHAS: UI (SUBMIT) — BOTÕES FUNCIONAIS ✅
+# CAMPANHAS: SUBMISSÃO (FUNCIONAL)
 # =========================
 class SubmitVideoModal(discord.ui.Modal):
     def __init__(self, campaign_id: int):
@@ -717,7 +511,8 @@ class SubmitVideoModal(discord.ui.Modal):
             conn.close()
             return await _safe_ephemeral(interaction, "⚠️ Este vídeo já foi submetido nesta campanha.")
 
-        appr = guild.get_channel(CAMPANHAS_APROVACAO_CHANNEL_ID)
+        # manda para aprovações (staff)
+        appr = guild.get_channel(VERIFICACOES_CHANNEL_ID)
         if appr:
             view = VideoApprovalView(
                 campaign_id=self.campaign_id,
@@ -737,29 +532,28 @@ class SubmitVideoModal(discord.ui.Modal):
         await _safe_ephemeral(interaction, "✅ Vídeo submetido! Aguarda aprovação do staff.")
 
 
-class SubmitVideoButton(discord.ui.Button):
+class SubmitView(discord.ui.View):
+    """
+    ✅ Sem router on_interaction.
+    ✅ Callbacks nativos => botões funcionam.
+    """
     def __init__(self, campaign_id: int):
-        super().__init__(
-            label="📥 Submeter vídeo",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"camp_submit_video_{int(campaign_id)}"
-        )
+        super().__init__(timeout=None)
         self.campaign_id = int(campaign_id)
 
-    async def callback(self, interaction: discord.Interaction):
+    @discord.ui.button(label="📥 Submeter vídeo", style=discord.ButtonStyle.primary, custom_id="submit_video_btn")
+    async def submit_video(self, a, b):
+        interaction, _ = _safe_button_pair(a, b)
+        if not interaction:
+            return
         await interaction.response.send_modal(SubmitVideoModal(self.campaign_id))
 
+    @discord.ui.button(label="📊 Ver estatísticas", style=discord.ButtonStyle.secondary, custom_id="submit_stats_btn")
+    async def view_stats(self, a, b):
+        interaction, _ = _safe_button_pair(a, b)
+        if not interaction:
+            return
 
-class ViewStatsButton(discord.ui.Button):
-    def __init__(self, campaign_id: int):
-        super().__init__(
-            label="📊 Ver estatísticas",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"camp_view_stats_{int(campaign_id)}"
-        )
-        self.campaign_id = int(campaign_id)
-
-    async def callback(self, interaction: discord.Interaction):
         conn = db_conn()
         cur = conn.cursor()
 
@@ -801,14 +595,6 @@ class ViewStatsButton(discord.ui.Button):
         )
 
 
-class SubmitView(discord.ui.View):
-    def __init__(self, campaign_id: int):
-        super().__init__(timeout=None)
-        cid = int(campaign_id)
-        self.add_item(SubmitVideoButton(cid))
-        self.add_item(ViewStatsButton(cid))
-
-
 class VideoApprovalView(discord.ui.View):
     def __init__(self, campaign_id: int, submitter_id: int, tiktok_url: str):
         super().__init__(timeout=None)
@@ -831,23 +617,6 @@ class VideoApprovalView(discord.ui.View):
             return
 
         conn = db_conn()
-        ok, msg = can_approve(conn, self.campaign_id, self.submitter_id)
-        if not ok:
-            conn.close()
-            for child in self.children:
-                child.disabled = True
-            try:
-                await interaction.message.edit(
-                    content=interaction.message.content.replace(
-                        "📌 Status: **PENDENTE**",
-                        f"📌 Status: **RECUSADO**\nMotivo: {msg}"
-                    ),
-                    view=self
-                )
-            except:
-                pass
-            return await _safe_ephemeral(interaction, f"❌ Não aprovado: {msg}")
-
         cur = conn.cursor()
         now = _now()
         cur.execute("""
@@ -868,7 +637,7 @@ class VideoApprovalView(discord.ui.View):
         except:
             pass
 
-        await _safe_ephemeral(interaction, "✅ Vídeo aprovado e entrou no tracking automático.")
+        await _safe_ephemeral(interaction, "✅ Vídeo aprovado.")
 
     @discord.ui.button(label="❌ Rejeitar vídeo", style=discord.ButtonStyle.red, custom_id="camp_reject_video")
     async def reject(self, a, b):
@@ -902,7 +671,7 @@ class VideoApprovalView(discord.ui.View):
 
 
 # =========================
-# CAMPANHAS: JOIN
+# CAMPANHAS: JOIN (FUNCIONAL)
 # =========================
 class JoinCampaignView(discord.ui.View):
     def __init__(self):
@@ -1014,7 +783,7 @@ class JoinCampaignView(discord.ui.View):
                 "📤 **Submete os teus vídeos aqui**\n\nUsa os botões abaixo 👇",
                 view=SubmitView(campaign_id=cid)
             )
-            lb_msg = await lb_ch.send("🏆 **LEADERBOARD**\n*(à espera de dados...)*")
+            lb_msg = await lb_ch.send("🏆 **LEADERBOARD**\n*(por agora sem atualização automática)*")
 
             cur.execute("""
                 UPDATE campaigns SET
@@ -1031,92 +800,6 @@ class JoinCampaignView(discord.ui.View):
 
         conn.close()
         await _safe_ephemeral(interaction, "✅ Aderiste à campanha! Vai à categoria da campanha para submeter.")
-
-
-# =========================
-# Tracking loop + Manual refresh
-# =========================
-async def run_tracking_once(guild: discord.Guild, only_campaign_id: Optional[int] = None) -> str:
-    if not APIFY_TOKEN:
-        return "⚠️ APIFY_TOKEN não definido — não dá para contar views."
-
-    conn = db_conn()
-    cur = conn.cursor()
-
-    if only_campaign_id:
-        cur.execute("SELECT id FROM campaigns WHERE status='active' AND id=?", (int(only_campaign_id),))
-    else:
-        cur.execute("SELECT id FROM campaigns WHERE status='active'")
-
-    active_campaigns = {int(r[0]) for r in cur.fetchall()}
-    if not active_campaigns:
-        conn.close()
-        return "✅ Done. Sem campanhas ativas."
-
-    if only_campaign_id:
-        cur.execute("""
-        SELECT id, campaign_id, tiktok_url
-        FROM submissions
-        WHERE status='approved' AND campaign_id=?
-        """, (int(only_campaign_id),))
-    else:
-        cur.execute("""
-        SELECT id, campaign_id, tiktok_url
-        FROM submissions
-        WHERE status='approved'
-        """)
-
-    subs = cur.fetchall()
-    conn.close()
-
-    if not subs:
-        for camp_id in active_campaigns:
-            await update_leaderboard_message(guild, int(camp_id))
-        return "✅ Done. Sem submissões aprovadas para atualizar."
-
-    updated = 0
-    async with aiohttp.ClientSession() as session:
-        for sub_id, camp_id, url in subs:
-            camp_id = int(camp_id)
-            if camp_id not in active_campaigns:
-                continue
-
-            views = await fetch_tiktok_views_apify(session, url)
-            if views is None:
-                continue
-
-            conn2 = db_conn()
-            cur2 = conn2.cursor()
-            cur2.execute("UPDATE submissions SET views_current=? WHERE id=?", (int(views), int(sub_id)))
-            conn2.commit()
-            update_one_submission_payment(conn2, int(sub_id))
-            conn2.close()
-            updated += 1
-
-    for camp_id in list(active_campaigns):
-        await update_leaderboard_message(guild, int(camp_id))
-
-    return f"✅ Done. Atualizei views em **{updated}** submissões."
-
-
-@tasks.loop(minutes=15)
-async def track_campaign_views_loop():
-    guild = bot.get_guild(SERVER_ID)
-    if not guild:
-        return
-    msg = await run_tracking_once(guild)
-    print("[TRACK LOOP]", msg)
-
-
-@commands.has_permissions(administrator=True)
-@bot.command()
-async def refreshviews(ctx, campaign_id: int = None):
-    if ctx.guild and ctx.guild.id != SERVER_ID:
-        return
-    await ctx.send("⏳ A atualizar views/leaderboard...")
-    guild = ctx.guild or bot.get_guild(SERVER_ID)
-    res = await run_tracking_once(guild, only_campaign_id=campaign_id)
-    await ctx.send(res)
 
 
 # =========================
@@ -1144,8 +827,8 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str, conteudo: st
     except discord.Forbidden:
         await _safe_ephemeral(
             interaction,
-            "❌ O bot não tem permissão para criar threads no canal suporte-staff.\n"
-            "Dá ao bot: **Create Public Threads / Create Private Threads / Send Messages / Manage Threads**."
+            "❌ O bot não tem permissão para criar threads.\n"
+            "Dá ao bot: **Create Public Threads / Send Messages / Manage Threads**."
         )
         return
 
@@ -1552,7 +1235,7 @@ async def campanha(ctx):
 
 
 # =========================
-# READY: reattach views (painéis antigos)
+# READY: reattach views
 # =========================
 async def reattach_pending_verification_views():
     guild = bot.get_guild(SERVER_ID)
@@ -1609,15 +1292,17 @@ async def reattach_submit_panels():
             if not submit_ch:
                 continue
             msg = await submit_ch.fetch_message(int(panel_msg_id))
-            await msg.edit(view=SubmitView(int(cid)))  # <-- aqui “re-regista” os botões
-        except Exception as e:
-            print("⚠️ reattach_submit_panels erro:", e)
+            # reanexa o painel com botões funcionais
+            await msg.edit(view=SubmitView(int(cid)))
+        except:
+            pass
 
 
 @bot.event
 async def on_ready():
     init_db()
 
+    # views persistentes (✅ obrigatório)
     if not getattr(bot, "_views_added", False):
         bot.add_view(MainView())
         bot.add_view(IbanButtons())
@@ -1630,12 +1315,6 @@ async def on_ready():
         await reattach_submit_panels()
     except Exception as e:
         print("⚠️ Erro ao reanexar views:", e)
-
-    if APIFY_TOKEN and (not track_campaign_views_loop.is_running()):
-        track_campaign_views_loop.start()
-        print("✅ APIFY_TOKEN OK — tracking de views ativo (loop 15 min).")
-    else:
-        print("⚠️ APIFY_TOKEN não definido — tracking de views NÃO vai atualizar (usa !refreshviews após definir o token).")
 
     print(f"✅ Bot ligado como {bot.user}!")
 
@@ -1666,16 +1345,11 @@ def keep_alive():
 TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN não encontrado. Define DISCORD_TOKEN no Render/Railway com o BOT TOKEN.")
+    raise RuntimeError("DISCORD_TOKEN não encontrado. Define DISCORD_TOKEN com o BOT TOKEN.")
 
 print("TOKEN_LEN:", len(TOKEN))
 print("TOKEN_DOTS:", TOKEN.count("."))
 print("TOKEN_HAS_WHITESPACE:", any(c.isspace() for c in TOKEN))
-
-if TOKEN.count(".") != 2 or len(TOKEN) < 40:
-    raise RuntimeError(
-        "Token inválido ou cortado. Faz reset no Discord Developer Portal (Bot -> Reset Token) e cola de novo em DISCORD_TOKEN."
-    )
 
 keep_alive()
 bot.run(TOKEN)
