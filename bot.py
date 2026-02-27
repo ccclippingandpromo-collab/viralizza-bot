@@ -18,9 +18,6 @@ print("PYTHON EXE:", sys.executable)
 print("PLATFORM:", platform.platform())
 
 # =========================
-# PATCH: audioop para Python 3.13/3.14
-# discord.py/voice pode tentar importar audioop -> crasha se não existir
-# =========================
 import aiohttp
 import discord
 from discord.ext import commands, tasks
@@ -1743,4 +1740,5 @@ if not TOKEN:
 
 keep_alive()
 bot.run(TOKEN)
+
 
