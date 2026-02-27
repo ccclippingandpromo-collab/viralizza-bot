@@ -930,7 +930,7 @@ class VideoApprovalView(discord.ui.View):
 
 
 # =========================
-# CAMPANHAS: JOIN (CORRIGIDO)
+# CAMPANHAS: JOIN (COM DEFER + ERROS CLAROS)
 # =========================
 class JoinCampaignView(discord.ui.View):
     """
@@ -944,6 +944,13 @@ class JoinCampaignView(discord.ui.View):
         interaction, _ = _safe_button_pair(a, b)
         if not interaction:
             return
+
+        # Evita "interaction failed"
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except:
+            pass
 
         guild = interaction.guild or bot.get_guild(SERVER_ID)
         if not guild:
@@ -974,7 +981,7 @@ class JoinCampaignView(discord.ui.View):
             return await _safe_ephemeral(
                 interaction,
                 "❌ Campanha não encontrada na base de dados.\n"
-                "➡️ Admin: republica a campanha com `!campanha` para registar novamente."
+                "➡️ Admin: usa `!campanha` para republicar e registar o post novamente."
             )
 
         (cid, name, platforms, content_types, audio_url,
@@ -989,21 +996,53 @@ class JoinCampaignView(discord.ui.View):
             return await _safe_ephemeral(interaction, "⚠️ Esta campanha já terminou.")
 
         if not category_id:
+            role_verified = guild.get_role(VERIFICADO_ROLE_ID)
+            bot_member = guild.me  # ok na maioria dos casos
+
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                guild.get_role(VERIFICADO_ROLE_ID): discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
             }
+            if role_verified:
+                overwrites[role_verified] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+            if bot_member:
+                overwrites[bot_member] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_channels=True
+                )
 
             admin_member = guild.get_member(ADMIN_USER_ID)
             if admin_member:
-                overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True)
+                overwrites[admin_member] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True,
+                    manage_channels=True
+                )
 
-            category = await guild.create_category(f"🎯 {name}", overwrites=overwrites)
-            details_ch = await guild.create_text_channel("1-detalhes-da-campanha", category=category)
-            req_ch = await guild.create_text_channel("2-requisitos", category=category)
-            submit_ch = await guild.create_text_channel("3-submeter-videos", category=category)
-            lb_ch = await guild.create_text_channel("4-leaderboard", category=category)
+            try:
+                category = await guild.create_category(f"🎯 {name}", overwrites=overwrites)
+                details_ch = await guild.create_text_channel("1-detalhes-da-campanha", category=category)
+                req_ch = await guild.create_text_channel("2-requisitos", category=category)
+                submit_ch = await guild.create_text_channel("3-submeter-videos", category=category)
+                lb_ch = await guild.create_text_channel("4-leaderboard", category=category)
+            except discord.Forbidden:
+                conn.close()
+                return await _safe_ephemeral(
+                    interaction,
+                    "⛔ **Falta permissão ao bot para criar categoria/canais.**\n"
+                    "✅ Dá ao bot: **Manage Channels** + coloca o cargo do bot **acima** do cargo *Verificado*.\n"
+                    "Depois tenta novamente."
+                )
+            except Exception as e:
+                conn.close()
+                return await _safe_ephemeral(interaction, f"❌ Erro ao criar canais: {repr(e)}")
 
             c = {
                 "name": name,
@@ -1596,7 +1635,7 @@ async def desverificar(ctx, member: discord.Member = None):
 
 
 # =========================
-# COMANDOS (CAMPANHAS)
+# COMANDOS (CAMPANHAS)  ✅ PATCH REPUBLICAR
 # =========================
 @commands.has_permissions(administrator=True)
 @bot.command()
@@ -1604,11 +1643,12 @@ async def campaign_test(ctx):
     if ctx.guild and ctx.guild.id != SERVER_ID:
         return
 
-    conn = db_conn()
-    cur = conn.cursor()
     now = _now()
     c = TREEZY_TEST_CAMPAIGN
 
+    # 1) Garantir campanha na DB
+    conn = db_conn()
+    cur = conn.cursor()
     cur.execute("""
     INSERT OR IGNORE INTO campaigns
     (name, slug, platforms, content_types, audio_url, rate_kz_per_1k,
@@ -1625,25 +1665,50 @@ async def campaign_test(ctx):
     row = get_campaign_by_slug(conn, c["slug"])
     if not row:
         conn.close()
-        return await ctx.send("❌ Erro ao criar campanha no DB.")
+        return await ctx.send("❌ Erro ao criar/ler campanha no DB.")
 
     post_msg_id = row[13]  # post_message_id
     conn.close()
 
+    # 2) Canal certo
     ch = ctx.guild.get_channel(CAMPANHAS_CHANNEL_ID)
     if not ch:
         return await ctx.send("❌ Canal de campanhas não encontrado.")
 
-    # Só publica se ainda não tem post associado
-    if not post_msg_id:
-        msg = await ch.send(campaign_post_text(c), view=JoinCampaignView())
+    # 3) Verificar se msg antiga ainda existe; se não, republica
+    must_repost = False
+    if post_msg_id:
+        try:
+            await ch.fetch_message(int(post_msg_id))
+        except discord.NotFound:
+            must_repost = True
+        except discord.Forbidden:
+            return await ctx.send("⛔ Falta permissão no #campanhas: **View Channel** e **Read Message History**.")
+        except Exception:
+            must_repost = True
+    else:
+        must_repost = True
+
+    if must_repost:
+        try:
+            msg = await ch.send(campaign_post_text(c), view=JoinCampaignView())
+        except discord.Forbidden:
+            return await ctx.send("⛔ Falta permissão no #campanhas: **Send Messages**.")
+        except Exception as e:
+            return await ctx.send(f"❌ Erro ao publicar campanha: {repr(e)}")
+
         conn2 = db_conn()
         cur2 = conn2.cursor()
-        cur2.execute("UPDATE campaigns SET post_message_id=? WHERE slug=?", (msg.id, c["slug"]))
+        cur2.execute(
+            "UPDATE campaigns SET post_message_id=?, campaigns_channel_id=? WHERE slug=?",
+            (msg.id, CAMPANHAS_CHANNEL_ID, c["slug"])
+        )
         conn2.commit()
         conn2.close()
 
-    await ctx.send("✅ Campanha teste publicada em #campanhas.")
+        return await ctx.send("✅ Campanha teste **republicada** em #campanhas.")
+
+    await ctx.send("✅ Campanha já estava publicada em #campanhas (não foi repostada).")
 
 
 # Alias pedido por ti: !campanha
@@ -1808,7 +1873,7 @@ async def on_ready():
         bot.add_view(MainView())
         bot.add_view(IbanButtons())
         bot.add_view(SuporteView())
-        bot.add_view(JoinCampaignView())  # ✅ global join (corrigido)
+        bot.add_view(JoinCampaignView())  # ✅ view global
         bot._views_added = True
 
     try:
