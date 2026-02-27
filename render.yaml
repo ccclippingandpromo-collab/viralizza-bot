@@ -1,7 +1,12 @@
 services:
- - type: web
-   name: viralizza-bot
-   env: python
-   plan: free
-   buildCommand: pip install -r requirements.txt
-   startCommand: python bot.py
+  - type: worker
+    name: viralizza-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DB_PATH
+        value: /var/data/database.sqlite3
