@@ -21,18 +21,6 @@ print("PLATFORM:", platform.platform())
 # PATCH: audioop para Python 3.13/3.14
 # discord.py/voice pode tentar importar audioop -> crasha se não existir
 # =========================
-try:
-    import audioop  # noqa: F401
-    print("AUDIOOP: OK (stdlib)")
-except Exception as e:
-    print("AUDIOOP: missing/failed -> trying audioop_lts. Error:", repr(e))
-    try:
-        import audioop_lts as _audioop_lts  # pip install audioop-lts
-        sys.modules["audioop"] = _audioop_lts
-        print("AUDIOOP: patched via audioop_lts ✅")
-    except Exception as e2:
-        print("AUDIOOP: patch FAILED ❌ -> install audioop-lts in requirements.txt. Error:", repr(e2))
-
 import aiohttp
 import discord
 from discord.ext import commands, tasks
@@ -1755,3 +1743,4 @@ if not TOKEN:
 
 keep_alive()
 bot.run(TOKEN)
+
