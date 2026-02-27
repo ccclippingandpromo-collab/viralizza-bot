@@ -39,10 +39,10 @@ ADMIN_USER_ID = 1376499031890460714
 DB_PATH = os.getenv("DB_PATH", "database.sqlite3")
 
 # ====== TikTok Views Provider (Apify) ======
-APIFY_TOKEN = os.getenv("APIFY_TOKEN")  # opcional
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")  # OBRIGATÓRIO se queres tracking real
 APIFY_ACTOR = os.getenv("APIFY_ACTOR", "clockworks/tiktok-scraper")
 
-# Onde cai aprovação/rejeição de vídeos (vamos usar o canal de verificações por enquanto)
+# Onde cai aprovação/rejeição de vídeos
 CAMPANHAS_APROVACAO_CHANNEL_ID = VERIFICACOES_CHANNEL_ID
 
 # =========================
@@ -102,7 +102,6 @@ def db_conn():
 
 
 def generate_verification_code() -> str:
-    # código sempre diferente (random)
     alphabet = string.ascii_uppercase + string.digits
     return "VZ-" + "".join(secrets.choice(alphabet) for _ in range(7))
 
@@ -130,9 +129,6 @@ async def fetch_member_safe(guild: discord.Guild, user_id: int):
 
 
 async def notify_user(member: discord.Member, content: str, fallback_channel_id: int | None = None):
-    """
-    Tenta DM. Se falhar, manda aviso no canal fallback (ex: #ligar-conta-e-verificar).
-    """
     try:
         await member.send(content)
         return True
@@ -148,7 +144,7 @@ async def notify_user(member: discord.Member, content: str, fallback_channel_id:
 
 
 # =========================
-# DB INIT (IBAN + SUPORTE + CAMPANHAS + VERIFICAÇÃO)
+# DB INIT
 # =========================
 def init_db():
     conn = db_conn()
@@ -173,14 +169,14 @@ def init_db():
     )
     """)
 
-    # VERIFICAÇÃO (persistente)
+    # VERIFICAÇÃO
     cur.execute("""
     CREATE TABLE IF NOT EXISTS verification_requests (
         user_id INTEGER PRIMARY KEY,
         social TEXT NOT NULL,
         username TEXT NOT NULL,
         code TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending', -- pending/verified/rejected
+        status TEXT NOT NULL DEFAULT 'pending',
         verify_message_id INTEGER,
         verify_channel_id INTEGER,
         created_at INTEGER NOT NULL,
@@ -206,7 +202,7 @@ def init_db():
         max_payout_user_kz INTEGER NOT NULL,
         max_posts_total INTEGER NOT NULL,
 
-        status TEXT NOT NULL DEFAULT 'active', -- active/closed
+        status TEXT NOT NULL DEFAULT 'active',
 
         campaigns_channel_id INTEGER,
         post_message_id INTEGER,
@@ -232,7 +228,7 @@ def init_db():
         tiktok_url TEXT NOT NULL,
         tiktok_video_id TEXT,
 
-        status TEXT NOT NULL DEFAULT 'pending', -- pending/approved/rejected/frozen
+        status TEXT NOT NULL DEFAULT 'pending',
 
         views_current INTEGER NOT NULL DEFAULT 0,
         paid_views INTEGER NOT NULL DEFAULT 0,
@@ -332,7 +328,7 @@ def close_ticket(thread_id: int):
     conn.close()
 
 
-# ===== VERIFICAÇÃO HELPERS (DB) =====
+# ===== VERIFICAÇÃO HELPERS =====
 def upsert_verification_request(user_id: int, social: str, username: str, code: str, status: str = "pending"):
     conn = db_conn()
     cur = conn.cursor()
@@ -620,6 +616,8 @@ async def update_leaderboard_message(guild: discord.Guild, campaign_id: int):
     conn.close()
 
     pct = 0 if bt == 0 else int((sk / bt) * 100)
+    remaining = max(0, int(bt) - int(sk))
+
     lines = [f"🏆 **LEADERBOARD — {name}**\n"]
     if top:
         for i, (uid, v) in enumerate(top, start=1):
@@ -629,6 +627,8 @@ async def update_leaderboard_message(guild: discord.Guild, campaign_id: int):
 
     lines.append("\n📊 **Progresso da campanha:**")
     lines.append(f"**{pct}%** | **{sk:,}/{bt:,} Kz**")
+    lines.append(f"💰 **Budget restante:** **{remaining:,} Kz**")
+
     if status != "active":
         lines.append("\n🔒 **Campanha encerrada.**")
 
@@ -645,7 +645,7 @@ async def update_leaderboard_message(guild: discord.Guild, campaign_id: int):
 
 
 # =========================
-# TikTok views via Apify (MVP)
+# TikTok views via Apify (FIX: mais robusto + logs)
 # =========================
 async def fetch_tiktok_views_apify(session: aiohttp.ClientSession, url: str):
     if not APIFY_TOKEN:
@@ -660,27 +660,44 @@ async def fetch_tiktok_views_apify(session: aiohttp.ClientSession, url: str):
         "shouldDownloadSlideshowImages": False,
     }
 
-    async with session.post(run_url, json=payload, timeout=60) as r:
-        if r.status >= 300:
-            return None
-        data = await r.json()
-        run_id = data.get("data", {}).get("id")
-        if not run_id:
-            return None
+    try:
+        async with session.post(run_url, json=payload, timeout=60) as r:
+            if r.status >= 300:
+                txt = await r.text()
+                print("APIFY run error:", r.status, txt[:300])
+                return None
+            data = await r.json()
+            run_id = data.get("data", {}).get("id")
+            if not run_id:
+                print("APIFY run_id missing:", data)
+                return None
+    except Exception as e:
+        print("APIFY post exception:", e)
+        return None
 
     status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
     st = None
-    for _ in range(12):
-        async with session.get(status_url, timeout=30) as r:
-            if r.status >= 300:
-                return None
-            st = await r.json()
-            status = st.get("data", {}).get("status")
-            if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-                break
+    for _ in range(18):  # até ~90s
+        try:
+            async with session.get(status_url, timeout=30) as r:
+                if r.status >= 300:
+                    txt = await r.text()
+                    print("APIFY status error:", r.status, txt[:300])
+                    return None
+                st = await r.json()
+                status = st.get("data", {}).get("status")
+                if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                    break
+        except Exception as e:
+            print("APIFY status exception:", e)
+            return None
         await asyncio.sleep(5)
 
     if not st:
+        return None
+
+    if st.get("data", {}).get("status") != "SUCCEEDED":
+        print("APIFY run not succeeded:", st.get("data", {}).get("status"))
         return None
 
     dataset_id = st.get("data", {}).get("defaultDatasetId")
@@ -688,23 +705,34 @@ async def fetch_tiktok_views_apify(session: aiohttp.ClientSession, url: str):
         return None
 
     items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true&limit=1&token={APIFY_TOKEN}"
-    async with session.get(items_url, timeout=60) as r:
-        if r.status >= 300:
-            return None
-        items = await r.json()
+    try:
+        async with session.get(items_url, timeout=60) as r:
+            if r.status >= 300:
+                txt = await r.text()
+                print("APIFY items error:", r.status, txt[:300])
+                return None
+            items = await r.json()
+    except Exception as e:
+        print("APIFY items exception:", e)
+        return None
 
     if not items:
         return None
 
     item = items[0]
     if isinstance(item, dict):
+        # vários formatos possíveis
         if isinstance(item.get("playCount"), (int, float)):
             return int(item["playCount"])
-        stats = item.get("stats") or item.get("statistics")
-        if isinstance(stats, dict) and isinstance(stats.get("playCount"), (int, float)):
-            return int(stats["playCount"])
-        if isinstance(stats, dict) and isinstance(stats.get("play_count"), (int, float)):
-            return int(stats["play_count"])
+        stats = item.get("stats") or item.get("statistics") or {}
+        if isinstance(stats, dict):
+            for k in ("playCount", "play_count", "plays", "viewCount", "view_count"):
+                if isinstance(stats.get(k), (int, float)):
+                    return int(stats[k])
+        # fallback: tenta chaves diretas
+        for k in ("viewCount", "view_count", "plays"):
+            if isinstance(item.get(k), (int, float)):
+                return int(item[k])
 
     return None
 
@@ -743,7 +771,6 @@ class SubmitVideoModal(discord.ui.Modal):
             return await _safe_ephemeral(interaction, "⚠️ Esta campanha já terminou.")
 
         url = str(self.url.value).strip()
-
         if not url.startswith("http://") and not url.startswith("https://"):
             conn.close()
             return await _safe_ephemeral(interaction, "❌ Link inválido. Envia um link completo com **https://**")
@@ -825,6 +852,8 @@ class SubmitView(discord.ui.View):
 
         conn.close()
 
+        remaining = max(0, int(bt) - int(sk))
+
         await _safe_ephemeral(
             interaction,
             f"📊 **As tuas stats (campanha {self.campaign_id})**\n"
@@ -833,6 +862,7 @@ class SubmitView(discord.ui.View):
             f"• Views já pagas: **{paid_views:,}**\n"
             f"• Ganho estimado: **{paid_kz:,} Kz** (máx {mx:,} Kz)\n\n"
             f"💰 Campanha: **{sk:,}/{bt:,} Kz**\n"
+            f"💳 Restante: **{remaining:,} Kz**\n"
             f"📌 Estado: **{st}**"
         )
 
@@ -930,11 +960,11 @@ class VideoApprovalView(discord.ui.View):
 
 
 # =========================
-# CAMPANHAS: JOIN (COM DEFER + ERROS CLAROS)
+# CAMPANHAS: JOIN
 # =========================
 class JoinCampaignView(discord.ui.View):
     """
-    View global (SEM slug). Encontra campanha pelo post_message_id = interaction.message.id
+    View global: encontra campanha pelo post_message_id = interaction.message.id
     """
     def __init__(self):
         super().__init__(timeout=None)
@@ -944,13 +974,6 @@ class JoinCampaignView(discord.ui.View):
         interaction, _ = _safe_button_pair(a, b)
         if not interaction:
             return
-
-        # Evita "interaction failed"
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.defer(ephemeral=True)
-        except:
-            pass
 
         guild = interaction.guild or bot.get_guild(SERVER_ID)
         if not guild:
@@ -981,7 +1004,7 @@ class JoinCampaignView(discord.ui.View):
             return await _safe_ephemeral(
                 interaction,
                 "❌ Campanha não encontrada na base de dados.\n"
-                "➡️ Admin: usa `!campanha` para republicar e registar o post novamente."
+                "➡️ Admin: republica a campanha com `!campanha` para registar novamente."
             )
 
         (cid, name, platforms, content_types, audio_url,
@@ -996,24 +1019,26 @@ class JoinCampaignView(discord.ui.View):
             return await _safe_ephemeral(interaction, "⚠️ Esta campanha já terminou.")
 
         if not category_id:
-            role_verified = guild.get_role(VERIFICADO_ROLE_ID)
-            bot_member = guild.me  # ok na maioria dos casos
-
+            # ✅ PERMISSÕES: verificados veem mas NÃO escrevem
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            }
-            if role_verified:
-                overwrites[role_verified] = discord.PermissionOverwrite(
+                guild.get_role(VERIFICADO_ROLE_ID): discord.PermissionOverwrite(
                     view_channel=True,
-                    send_messages=True,
-                    read_message_history=True
-                )
-            if bot_member:
-                overwrites[bot_member] = discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
                     read_message_history=True,
-                    manage_channels=True
+                    send_messages=False,
+                    add_reactions=True
+                ),
+            }
+
+            # bot + admin com perms totais
+            me = guild.me
+            if me:
+                overwrites[me] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    manage_channels=True,
+                    manage_messages=True,
+                    read_message_history=True
                 )
 
             admin_member = guild.get_member(ADMIN_USER_ID)
@@ -1021,28 +1046,38 @@ class JoinCampaignView(discord.ui.View):
                 overwrites[admin_member] = discord.PermissionOverwrite(
                     view_channel=True,
                     send_messages=True,
-                    read_message_history=True,
+                    manage_channels=True,
                     manage_messages=True,
-                    manage_channels=True
+                    read_message_history=True
                 )
 
             try:
                 category = await guild.create_category(f"🎯 {name}", overwrites=overwrites)
-                details_ch = await guild.create_text_channel("1-detalhes-da-campanha", category=category)
-                req_ch = await guild.create_text_channel("2-requisitos", category=category)
-                submit_ch = await guild.create_text_channel("3-submeter-videos", category=category)
-                lb_ch = await guild.create_text_channel("4-leaderboard", category=category)
             except discord.Forbidden:
                 conn.close()
                 return await _safe_ephemeral(
                     interaction,
-                    "⛔ **Falta permissão ao bot para criar categoria/canais.**\n"
-                    "✅ Dá ao bot: **Manage Channels** + coloca o cargo do bot **acima** do cargo *Verificado*.\n"
-                    "Depois tenta novamente."
+                    "⛔ Falta permissão ao bot para criar categoria/canais.\n"
+                    "✅ Dá ao bot: **Manage Channels** e garante que o cargo do bot está acima dos cargos que ele precisa gerir."
                 )
-            except Exception as e:
-                conn.close()
-                return await _safe_ephemeral(interaction, f"❌ Erro ao criar canais: {repr(e)}")
+
+            details_ch = await guild.create_text_channel("1-detalhes-da-campanha", category=category)
+            req_ch = await guild.create_text_channel("2-requisitos", category=category)
+            submit_ch = await guild.create_text_channel("3-submeter-videos", category=category)
+            lb_ch = await guild.create_text_channel("4-leaderboard", category=category)
+
+            # submit channel: só bot/admin escrevem
+            try:
+                await submit_ch.edit(overwrites={
+                    **overwrites,
+                    guild.get_role(VERIFICADO_ROLE_ID): discord.PermissionOverwrite(
+                        view_channel=True,
+                        read_message_history=True,
+                        send_messages=False
+                    )
+                })
+            except:
+                pass
 
             c = {
                 "name": name,
@@ -1084,14 +1119,14 @@ class JoinCampaignView(discord.ui.View):
 # =========================
 # CAMPANHAS: Tracking loop
 # =========================
-@tasks.loop(minutes=15)
-async def track_campaign_views_loop():
-    if not APIFY_TOKEN:
-        return
-
+async def _do_tracking_once(force: bool = False):
+    """
+    Corre 1 ciclo: busca views para submissões aprovadas e atualiza pagamentos + leaderboard.
+    Se APIFY_TOKEN não existir, só atualiza leaderboard (sem views).
+    """
     guild = bot.get_guild(SERVER_ID)
     if not guild:
-        return
+        return False, "Guild não encontrada."
 
     conn = db_conn()
     cur = conn.cursor()
@@ -1107,9 +1142,21 @@ async def track_campaign_views_loop():
     subs = cur.fetchall()
     conn.close()
 
-    if not subs or not active_campaigns:
-        return
+    if not active_campaigns:
+        return False, "Sem campanhas ativas."
 
+    # sem apify: só leaderboard
+    if not APIFY_TOKEN:
+        for camp_id in list(active_campaigns):
+            await update_leaderboard_message(guild, int(camp_id))
+        return False, "APIFY_TOKEN não definido — leaderboard atualizado, mas views não foram buscadas."
+
+    if not subs:
+        for camp_id in list(active_campaigns):
+            await update_leaderboard_message(guild, int(camp_id))
+        return True, "Sem submissões aprovadas (nada para buscar)."
+
+    updated_any = False
     async with aiohttp.ClientSession() as session:
         for sub_id, camp_id, url in subs:
             camp_id = int(camp_id)
@@ -1127,9 +1174,33 @@ async def track_campaign_views_loop():
 
             update_one_submission_payment(conn2, int(sub_id))
             conn2.close()
+            updated_any = True
 
         for camp_id in list(active_campaigns):
             await update_leaderboard_message(guild, int(camp_id))
+
+    return updated_any, "Tracking executado."
+
+
+@tasks.loop(minutes=15)
+async def track_campaign_views_loop():
+    try:
+        await _do_tracking_once()
+    except Exception as e:
+        print("track_campaign_views_loop error:", e)
+
+
+# =========================
+# COMANDO: refresh views manual
+# =========================
+@commands.has_permissions(administrator=True)
+@bot.command(name="refreshviews")
+async def refreshviews(ctx):
+    if ctx.guild and ctx.guild.id != SERVER_ID:
+        return
+    await ctx.send("⏳ A atualizar views/leaderboard...")
+    ok, msg = await _do_tracking_once(force=True)
+    await ctx.send(f"✅ Done. {msg}")
 
 
 # =========================
@@ -1635,7 +1706,7 @@ async def desverificar(ctx, member: discord.Member = None):
 
 
 # =========================
-# COMANDOS (CAMPANHAS)  ✅ PATCH REPUBLICAR
+# COMANDOS (CAMPANHAS)
 # =========================
 @commands.has_permissions(administrator=True)
 @bot.command()
@@ -1643,12 +1714,11 @@ async def campaign_test(ctx):
     if ctx.guild and ctx.guild.id != SERVER_ID:
         return
 
+    conn = db_conn()
+    cur = conn.cursor()
     now = _now()
     c = TREEZY_TEST_CAMPAIGN
 
-    # 1) Garantir campanha na DB
-    conn = db_conn()
-    cur = conn.cursor()
     cur.execute("""
     INSERT OR IGNORE INTO campaigns
     (name, slug, platforms, content_types, audio_url, rate_kz_per_1k,
@@ -1665,53 +1735,40 @@ async def campaign_test(ctx):
     row = get_campaign_by_slug(conn, c["slug"])
     if not row:
         conn.close()
-        return await ctx.send("❌ Erro ao criar/ler campanha no DB.")
+        return await ctx.send("❌ Erro ao criar campanha no DB.")
 
     post_msg_id = row[13]  # post_message_id
     conn.close()
 
-    # 2) Canal certo
     ch = ctx.guild.get_channel(CAMPANHAS_CHANNEL_ID)
     if not ch:
         return await ctx.send("❌ Canal de campanhas não encontrado.")
 
-    # 3) Verificar se msg antiga ainda existe; se não, republica
-    must_repost = False
+    # Se já existe post associado, apaga e republica (para garantir o post + button certo)
     if post_msg_id:
         try:
-            await ch.fetch_message(int(post_msg_id))
-        except discord.NotFound:
-            must_repost = True
-        except discord.Forbidden:
-            return await ctx.send("⛔ Falta permissão no #campanhas: **View Channel** e **Read Message History**.")
-        except Exception:
-            must_repost = True
-    else:
-        must_repost = True
+            old = await ch.fetch_message(int(post_msg_id))
+            await old.delete()
+        except:
+            pass
 
-    if must_repost:
-        try:
-            msg = await ch.send(campaign_post_text(c), view=JoinCampaignView())
-        except discord.Forbidden:
-            return await ctx.send("⛔ Falta permissão no #campanhas: **Send Messages**.")
-        except Exception as e:
-            return await ctx.send(f"❌ Erro ao publicar campanha: {repr(e)}")
+        conn3 = db_conn()
+        cur3 = conn3.cursor()
+        cur3.execute("UPDATE campaigns SET post_message_id=NULL WHERE slug=?", (c["slug"],))
+        conn3.commit()
+        conn3.close()
 
-        conn2 = db_conn()
-        cur2 = conn2.cursor()
-        cur2.execute(
-            "UPDATE campaigns SET post_message_id=?, campaigns_channel_id=? WHERE slug=?",
-            (msg.id, CAMPANHAS_CHANNEL_ID, c["slug"])
-        )
-        conn2.commit()
-        conn2.close()
+    msg = await ch.send(campaign_post_text(c), view=JoinCampaignView())
+    conn2 = db_conn()
+    cur2 = conn2.cursor()
+    cur2.execute("UPDATE campaigns SET post_message_id=? WHERE slug=?", (msg.id, c["slug"]))
+    conn2.commit()
+    conn2.close()
 
-        return await ctx.send("✅ Campanha teste **republicada** em #campanhas.")
-
-    await ctx.send("✅ Campanha já estava publicada em #campanhas (não foi repostada).")
+    await ctx.send("✅ Campanha teste republicada em #campanhas.")
 
 
-# Alias pedido por ti: !campanha
+# Alias: !campanha
 @commands.has_permissions(administrator=True)
 @bot.command(name="campanha")
 async def campanha(ctx):
@@ -1802,7 +1859,7 @@ async def on_message(message: discord.Message):
 
 
 # =========================
-# READY: reanexar botões nas msgs antigas (verificação + submit panel)
+# READY: reanexar views nas msgs antigas
 # =========================
 async def reattach_pending_verification_views():
     guild = bot.get_guild(SERVER_ID)
@@ -1873,7 +1930,7 @@ async def on_ready():
         bot.add_view(MainView())
         bot.add_view(IbanButtons())
         bot.add_view(SuporteView())
-        bot.add_view(JoinCampaignView())  # ✅ view global
+        bot.add_view(JoinCampaignView())
         bot._views_added = True
 
     try:
@@ -1882,11 +1939,11 @@ async def on_ready():
     except Exception as e:
         print("⚠️ Erro ao reanexar views:", e)
 
-    if APIFY_TOKEN and (not track_campaign_views_loop.is_running()):
+    if not track_campaign_views_loop.is_running():
         track_campaign_views_loop.start()
 
     if not APIFY_TOKEN:
-        print("⚠️ APIFY_TOKEN não definido — tracking de views NÃO vai atualizar (mas o bot funciona).")
+        print("⚠️ APIFY_TOKEN não definido — tracking de views NÃO vai atualizar (usa !refreshviews só para leaderboard).")
     else:
         print("✅ APIFY_TOKEN OK — tracking de views ativo.")
 
