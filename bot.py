@@ -1723,20 +1723,17 @@ def keep_alive():
 
 
 # =========================
-# RUN  (CORRIGIDO)
+# RUN
 # =========================
-# Lê APENAS DISCORD_TOKEN para evitar pegar token velho por engano
 TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN não encontrado. Define DISCORD_TOKEN no Render/Railway com o BOT TOKEN.")
 
-# Debug seguro (não mostra o token)
 print("TOKEN_LEN:", len(TOKEN))
 print("TOKEN_DOTS:", TOKEN.count("."))
 print("TOKEN_HAS_WHITESPACE:", any(c.isspace() for c in TOKEN))
 
-# Validação leve do formato (evita token cortado)
 if TOKEN.count(".") != 2 or len(TOKEN) < 40:
     raise RuntimeError(
         "Token inválido ou cortado. Faz reset no Discord Developer Portal (Bot -> Reset Token) e cola de novo em DISCORD_TOKEN."
