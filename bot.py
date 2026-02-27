@@ -1725,7 +1725,7 @@ def keep_alive():
 # =========================
 # RUN
 # =========================
-TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
+TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável DISCORD_TOKEN no Render/Railway.")
 
@@ -1738,7 +1738,11 @@ print("TOKEN_ENDS_WITH_QUOTES:", TOKEN[-1:] in ["'", '"'])
 
 # Se não tiver 2 pontos, não é bot token válido (ou veio cortado/errado)
 if TOKEN.count(".") != 2:
-    raise RuntimeError("DISCORD_TOKEN parece mal-formado (não tem 2 pontos). Copia o BOT TOKEN (Developer Portal -> Bot -> Reset Token -> Copy) e cola SEM aspas/sem espaços.")
+    raise RuntimeError
+        "Token parece mal-formatado (não tem 2 pontos). "
+        "Vai ao Developer Portal -> Bot -> Reset Token -> Copy e cola no Render."
+
+    )
 
 keep_alive()
 bot.run(TOKEN)
