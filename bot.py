@@ -8,23 +8,10 @@ import secrets
 import string
 from typing import Optional
 
-# =========================
-# DEBUG: provar versão real do Python no Render
-# (tem de estar ANTES do import discord)
-# =========================
-import sys, platform
-print("PYTHON VERSION:", sys.version)
-print("PYTHON EXE:", sys.executable)
-print("PLATFORM:", platform.platform())
-
-# =========================
 import aiohttp
 import discord
 from discord.ext import commands, tasks
 from flask import Flask
-
-print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
-print("DISCORD FILE:", getattr(discord, "__file__", "unknown"))
 
 # =========================
 # CONFIG (TEUS IDS)
@@ -56,6 +43,11 @@ APIFY_ACTOR = os.getenv("APIFY_ACTOR", "clockworks/tiktok-scraper")
 
 # Onde cai aprovação/rejeição de vídeos
 CAMPANHAS_APROVACAO_CHANNEL_ID = VERIFICACOES_CHANNEL_ID
+
+print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
+print("DISCORD FILE:", getattr(discord, "__file__", "unknown"))
+print("DB_PATH:", DB_PATH)
+print("APIFY_TOKEN set?:", bool(APIFY_TOKEN))
 
 # =========================
 # BOT / INTENTS
@@ -1705,10 +1697,9 @@ async def on_ready():
         track_campaign_views_loop.start()
         print("✅ APIFY_TOKEN OK — tracking de views ativo (loop 15 min).")
     else:
-        print("⚠️ APIFY_TOKEN não definido — tracking de views NÃO vai atualizar (usa !refreshviews apenas se definires o token).")
+        print("⚠️ APIFY_TOKEN não definido — tracking de views NÃO vai atualizar (usa !refreshviews após definir o token).")
 
     print(f"✅ Bot ligado como {bot.user}!")
-    print("✅ DB_PATH:", DB_PATH)
 
 
 # =========================
@@ -1734,11 +1725,20 @@ def keep_alive():
 # =========================
 # RUN
 # =========================
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN não encontrado. Define a variável DISCORD_TOKEN no Render/Railway.")
 
+# DEBUG SEGURO DO TOKEN (NÃO IMPRIME O TOKEN)
+print("TOKEN_LEN:", len(TOKEN))
+print("TOKEN_DOTS:", TOKEN.count("."))
+print("TOKEN_HAS_SPACE:", any(c.isspace() for c in TOKEN))
+print("TOKEN_STARTS_WITH_QUOTES:", TOKEN[:1] in ["'", '"'])
+print("TOKEN_ENDS_WITH_QUOTES:", TOKEN[-1:] in ["'", '"'])
+
+# Se não tiver 2 pontos, não é bot token válido (ou veio cortado/errado)
+if TOKEN.count(".") != 2:
+    raise RuntimeError("DISCORD_TOKEN parece mal-formado (não tem 2 pontos). Copia o BOT TOKEN (Developer Portal -> Bot -> Reset Token -> Copy) e cola SEM aspas/sem espaços.")
+
 keep_alive()
 bot.run(TOKEN)
-
-
