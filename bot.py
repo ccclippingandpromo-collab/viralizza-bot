@@ -2,7 +2,6 @@ import os
 import re
 import time
 import sqlite3
-import threading
 import asyncio
 import secrets
 import string
@@ -11,7 +10,6 @@ from typing import Optional
 import aiohttp
 import discord
 from discord.ext import commands, tasks
-from flask import Flask
 
 # =========================
 # TOKEN (Render env: TOKEN)
@@ -45,8 +43,9 @@ SUPORTE_STAFF_CHANNEL_ID = 1474938549181874320
 VERIFICADO_ROLE_ID = 1473886534439538699
 ADMIN_USER_ID = 1376499031890460714
 
-# DB
-DB_PATH = os.getenv("DB_PATH", "/var/data/database.sqlite3")
+# DB (Render env: DB_PATH)
+# No FREE/worker sem disk, usa /tmp
+DB_PATH = os.getenv("DB_PATH", "/tmp/database.sqlite3").strip()
 
 # APIFY (views automáticas)
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
@@ -115,12 +114,17 @@ async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True):
     except Exception:
         pass
 
-async def safe_reply(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+async def safe_reply(
+    interaction: discord.Interaction,
+    content: str,
+    ephemeral: bool = True,
+    view: Optional[discord.ui.View] = None
+):
     try:
         if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=ephemeral)
+            await interaction.followup.send(content, ephemeral=ephemeral, view=view)
         else:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
+            await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
     except Exception as e:
         print("⚠️ safe_reply falhou:", e)
 
@@ -759,7 +763,6 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
         return None
 
 def extract_views_from_item(item: dict) -> Optional[int]:
-    # tenta vários campos comuns
     candidates = [
         "playCount", "plays", "views", "viewCount", "videoViewCount", "video_view_count",
         "videoPlayCount", "video_play_count"
@@ -789,7 +792,6 @@ async def apify_get_views_for_url(url: str) -> Optional[int]:
         return extract_views_from_item(item) if item else None
 
     if platform == "instagram":
-        # input típico do apify/instagram-scraper (pode variar por updates do actor)
         payload = {
             "directUrls": [url],
             "resultsType": "posts",
@@ -833,10 +835,8 @@ async def refresh_views_loop():
             conn2 = db_conn()
             cur2 = conn2.cursor()
 
-            # atualiza views atuais
             cur2.execute("UPDATE submissions SET views_current=? WHERE id=?", (int(views), int(sub_id)))
 
-            # paga só blocos de 1000
             payable_total = (int(views) // 1000) * 1000
             to_pay_views = payable_total - int(paid_views)
             if to_pay_views < 1000:
@@ -846,7 +846,6 @@ async def refresh_views_loop():
 
             to_pay_kz = (to_pay_views // 1000) * int(rate)
 
-            # cap por user
             cur2.execute("SELECT COALESCE(paid_kz,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
                          (int(camp_id), int(user_id)))
             rowu = cur2.fetchone()
@@ -861,7 +860,6 @@ async def refresh_views_loop():
                 to_pay_views = max_blocks * 1000
                 to_pay_kz = max_blocks * int(rate)
 
-            # cap por budget
             remaining_budget = max(0, int(budget_total) - int(spent_kz))
             if remaining_budget <= 0:
                 cur2.execute("UPDATE campaigns SET status='ended' WHERE id=?", (int(camp_id),))
@@ -879,7 +877,6 @@ async def refresh_views_loop():
                 conn2.close()
                 continue
 
-            # aplica pagamento
             cur2.execute("""
             INSERT INTO campaign_users (campaign_id, user_id, paid_kz, total_views_paid)
             VALUES (?, ?, ?, ?)
@@ -923,7 +920,6 @@ async def on_interaction(interaction: discord.Interaction):
 
         # -------- CONNECT --------
         if cid == "vz:connect":
-            # envia um select menu em ephemeral (sem bug)
             view = discord.ui.View(timeout=120)
             select = discord.ui.Select(
                 placeholder="Escolhe a rede social",
@@ -941,7 +937,9 @@ async def on_interaction(interaction: discord.Interaction):
 
             select.callback = _cb
             view.add_item(select)
-            return await safe_reply(interaction, "Escolhe a rede social:", ephemeral=True)
+
+            # ✅ BUG FIX: agora manda a view com o select
+            return await safe_reply(interaction, "Escolhe a rede social:", ephemeral=True, view=view)
 
         if cid == "vz:view_account":
             await safe_defer(interaction, ephemeral=True)
@@ -1049,8 +1047,11 @@ async def on_interaction(interaction: discord.Interaction):
             post_id = interaction.message.id
             conn = db_conn()
             cur = conn.cursor()
-            cur.execute("SELECT id, name, platforms, content_types, audio_url, rate_kz_per_1k, budget_total_kz, spent_kz, max_payout_user_kz, max_posts_total, status, category_id FROM campaigns WHERE post_message_id=?",
-                        (post_id,))
+            cur.execute(
+                "SELECT id, name, platforms, content_types, audio_url, rate_kz_per_1k, budget_total_kz, spent_kz, max_payout_user_kz, max_posts_total, status, category_id "
+                "FROM campaigns WHERE post_message_id=?",
+                (post_id,)
+            )
             row = cur.fetchone()
             if not row:
                 conn.close()
@@ -1223,24 +1224,22 @@ async def on_ready():
     print(f"✅ Bot ligado como {bot.user}!")
 
 # =========================
-# WEB (para Web Service)
+# RUN (anti-429 loop)
 # =========================
-app = Flask(__name__)
+async def runner():
+    backoff = 30
+    while True:
+        try:
+            await bot.start(BOT_TOKEN)
+        except discord.HTTPException as e:
+            # se bater 429 / rate limit, não crasha em loop
+            print(f"❌ HTTPException no login: {e}")
+            print(f"⏳ Vou esperar {backoff}s e tentar de novo (sem crashar o Render).")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 1800)  # até 30 min
+        except Exception as e:
+            print(f"❌ Erro fatal: {e}")
+            await asyncio.sleep(30)
 
-@app.get("/")
-def home():
-    return "Viralizza Bot is running!"
-
-def run_web():
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
-
-def keep_alive():
-    t = threading.Thread(target=run_web, daemon=True)
-    t.start()
-
-# =========================
-# RUN
-# =========================
-keep_alive()
-bot.run(BOT_TOKEN)
+if __name__ == "__main__":
+    asyncio.run(runner())
