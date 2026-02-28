@@ -54,7 +54,7 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/database.sqlite3").strip()
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
 APIFY_ACTOR_TIKTOK = os.getenv("APIFY_ACTOR_TIKTOK", "clockworks/tiktok-scraper").strip()
 APIFY_ACTOR_INSTAGRAM = os.getenv("APIFY_ACTOR_INSTAGRAM", "apify/instagram-scraper").strip()
-VIEWS_REFRESH_MINUTES = int((os.getenv("VIEWS_REFRESH_MINUTES", "10") or "10").strip())
+VIEWS_REFRESH_MINUTES = int(os.getenv("VIEWS_REFRESH_MINUTES", "10").strip() or "10")
 
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
 print("DB_PATH:", DB_PATH)
@@ -72,7 +72,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# HTTP SESSION (GLOBAL)
+# HTTP SESSION (GLOBAL) - evita "Unclosed client session"
 # =========================
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
@@ -127,18 +127,18 @@ async def fetch_member_safe(guild: discord.Guild, user_id: int):
     except:
         return None
 
-async def get_bot_member(guild: discord.Guild) -> Optional[discord.Member]:
-    """FIX: guild.me pode vir None em alguns casos; isto garante que temos o membro do bot."""
+async def get_bot_member_safe(guild: discord.Guild) -> Optional[discord.Member]:
+    """Fix: guild.me pode vir None; isto garante o membro do bot."""
     try:
-        me = guild.me
-        if me:
-            return me
+        if guild.me:
+            return guild.me
     except:
         pass
     try:
-        m = guild.get_member(bot.user.id) if bot.user else None
-        if m:
-            return m
+        if bot.user:
+            m = guild.get_member(bot.user.id)
+            if m:
+                return m
     except:
         pass
     try:
@@ -357,7 +357,7 @@ def list_pending_verifications():
     return rows
 
 # =========================
-# CAMPANHA TESTE
+# CAMPANHA TESTE (a tua)
 # =========================
 TREEZY_TEST_CAMPAIGN = {
     "name": "Treezy Flacko – Kwarran",
@@ -466,52 +466,130 @@ def submission_approval_view(submission_id: int) -> discord.ui.View:
     return v
 
 # =========================
-# SUPORTE (PAINEL + TICKETS)
+# SUPORTE - EXACTO COMO PEDISTE (2 botões + modals)
 # =========================
-class SuporteView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+def _safe_channel_name(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"[^a-z0-9\-]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s[:90] if s else "ticket"
 
-    @discord.ui.button(label="🎫 Abrir Ticket", style=discord.ButtonStyle.success, custom_id="vz:support:open")
-    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+async def create_support_ticket_channel(guild: discord.Guild, user: discord.Member, prefix: str) -> discord.TextChannel:
+    base_ch = guild.get_channel(SUPORTE_CHANNEL_ID)
+    category = base_ch.category if base_ch else None
+
+    admin_member = await fetch_member_safe(guild, ADMIN_USER_ID)
+    bot_member = await get_bot_member_safe(guild)
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+    if admin_member:
+        overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+    if bot_member:
+        overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True)
+
+    name = _safe_channel_name(f"{prefix}-{user.name}")
+    ch = await guild.create_text_channel(name=name, category=category, overwrites=overwrites)
+    return ch
+
+class CampaignIssueModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Problema com Campanha")
+        self.campaign_name = discord.ui.TextInput(
+            label="Nome da campanha",
+            placeholder="Ex: Treezy Flacko – Kwarran",
+            required=True,
+            max_length=80
+        )
+        self.problem = discord.ui.TextInput(
+            label="Descreve o problema",
+            placeholder="Explica o que aconteceu (erro, botão, views, pagamento, etc.)",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=900
+        )
+        self.add_item(self.campaign_name)
+        self.add_item(self.problem)
+
+    async def on_submit(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True)
+
         guild = interaction.guild or bot.get_guild(SERVER_ID)
         if not guild:
             return await safe_reply(interaction, "⚠️ Servidor não encontrado.", ephemeral=True)
 
-        # categoria: tenta usar a categoria do canal de suporte
-        base_ch = guild.get_channel(SUPORTE_CHANNEL_ID)
-        category = base_ch.category if base_ch else None
+        member = await fetch_member_safe(guild, interaction.user.id)
+        if not member:
+            return await safe_reply(interaction, "⚠️ Não consegui buscar o teu membro.", ephemeral=True)
 
-        # overwrites (user + admin + bot)
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        }
+        ticket = await create_support_ticket_channel(guild, member, "campanha")
 
-        admin_member = await fetch_member_safe(guild, ADMIN_USER_ID)
-        if admin_member:
-            overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
-
-        bot_member = await get_bot_member(guild)
-        if bot_member:
-            overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True)
-
-        ch = await guild.create_text_channel(
-            name=f"ticket-{interaction.user.name}".lower().replace(" ", "-")[:90],
-            category=category,
-            overwrites=overwrites
-        )
-
-        await ch.send(f"{interaction.user.mention} ✅ Ticket criado. Explica o teu problema aqui.")
         staff_ch = guild.get_channel(SUPORTE_STAFF_CHANNEL_ID)
         if staff_ch:
-            await staff_ch.send(f"🆕 Ticket criado: {ch.mention} | User: {interaction.user.mention} (`{interaction.user.id}`)")
+            await staff_ch.send(f"🆕 Ticket (campanha): {ticket.mention} | User: {member.mention} (`{member.id}`)")
 
-        return await safe_reply(interaction, f"✅ Ticket criado: {ch.mention}", ephemeral=True)
+        await ticket.send(
+            f"🎯 **Ticket: Problema com Campanha**\n"
+            f"👤 **User:** {member.mention} (`{member.id}`)\n"
+            f"🏷️ **Campanha:** {self.campaign_name.value}\n\n"
+            f"🧾 **Problema:**\n{self.problem.value}"
+        )
+
+        return await safe_reply(interaction, f"✅ Ticket criado: {ticket.mention}", ephemeral=True)
+
+class DoubtsModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Dúvidas")
+        self.question = discord.ui.TextInput(
+            label="Escreve a tua dúvida",
+            placeholder="Escreve aqui a tua pergunta",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=900
+        )
+        self.add_item(self.question)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True)
+
+        guild = interaction.guild or bot.get_guild(SERVER_ID)
+        if not guild:
+            return await safe_reply(interaction, "⚠️ Servidor não encontrado.", ephemeral=True)
+
+        member = await fetch_member_safe(guild, interaction.user.id)
+        if not member:
+            return await safe_reply(interaction, "⚠️ Não consegui buscar o teu membro.", ephemeral=True)
+
+        ticket = await create_support_ticket_channel(guild, member, "duvida")
+
+        staff_ch = guild.get_channel(SUPORTE_STAFF_CHANNEL_ID)
+        if staff_ch:
+            await staff_ch.send(f"🆕 Ticket (dúvida): {ticket.mention} | User: {member.mention} (`{member.id}`)")
+
+        await ticket.send(
+            f"❓ **Ticket: Dúvida**\n"
+            f"👤 **User:** {member.mention} (`{member.id}`)\n\n"
+            f"📝 **Dúvida:**\n{self.question.value}"
+        )
+
+        return await safe_reply(interaction, f"✅ Ticket criado: {ticket.mention}", ephemeral=True)
+
+class SupportPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🧨 Problema com campanha", style=discord.ButtonStyle.danger, custom_id="vz:support:campaign")
+    async def campaign_issue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        return await interaction.response.send_modal(CampaignIssueModal())
+
+    @discord.ui.button(label="💬 Dúvidas", style=discord.ButtonStyle.primary, custom_id="vz:support:doubts")
+    async def doubts(self, interaction: discord.Interaction, button: discord.ui.Button):
+        return await interaction.response.send_modal(DoubtsModal())
 
 # =========================
-# MODALS
+# MODALS (resto do sistema)
 # =========================
 class UsernameModal(discord.ui.Modal):
     def __init__(self, social: str, code: str):
@@ -658,15 +736,7 @@ async def ibanpanel(ctx):
 async def suporte(ctx):
     if ctx.guild and ctx.guild.id != SERVER_ID:
         return
-    # opcional: só admin pode mandar painel
-    if ctx.author.id != ADMIN_USER_ID:
-        return await ctx.send("❌ Apenas admin pode enviar o painel de suporte.")
-    embed = discord.Embed(
-        title="🎫 Suporte Viralizzaa",
-        description="Precisas de ajuda?\n\nClica no botão abaixo para abrir um ticket.",
-        color=0xFFD700
-    )
-    await ctx.send(embed=embed, view=SuporteView())
+    await ctx.send("🎫 **SUPORTE**\nEscolhe uma opção:", view=SupportPanelView())
 
 @commands.has_permissions(administrator=True)
 @bot.command()
@@ -1006,7 +1076,6 @@ async def before_refresh_views():
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     try:
-        # mantém compatibilidade com outros tipos de interaction
         if interaction.type != discord.InteractionType.component:
             return
 
@@ -1051,11 +1120,6 @@ async def on_interaction(interaction: discord.Interaction):
                 + ("" if status == "verified" else f"📌 Status: **{status.upper()}**")
             )
             return await safe_reply(interaction, msg, ephemeral=True)
-
-        # -------- SUPPORT --------
-        if cid == "vz:support:open":
-            # deixa o SuporteView tratar
-            return
 
         # -------- VERIFY APPROVAL --------
         if cid.startswith("vz:verify:"):
@@ -1135,7 +1199,11 @@ async def on_interaction(interaction: discord.Interaction):
             iban, updated_at = row
             return await safe_reply(interaction, f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}", ephemeral=True)
 
-        # -------- JOIN CAMPAIGN (FIX guild.me) --------
+        # -------- SUPORTE (os botões estão nas views/modals) --------
+        if cid in ("vz:support:campaign", "vz:support:doubts"):
+            return  # handled by discord.ui callbacks
+
+        # -------- JOIN CAMPAIGN --------
         if cid == "vz:camp:join":
             await safe_defer(interaction, ephemeral=True)
             guild = interaction.guild or bot.get_guild(SERVER_ID)
@@ -1148,11 +1216,8 @@ async def on_interaction(interaction: discord.Interaction):
             post_id = interaction.message.id
             conn = db_conn()
             cur = conn.cursor()
-            cur.execute("""
-                SELECT id, name, platforms, content_types, audio_url, rate_kz_per_1k,
-                       budget_total_kz, spent_kz, max_payout_user_kz, max_posts_total, status, category_id
-                FROM campaigns WHERE post_message_id=?
-            """, (post_id,))
+            cur.execute("SELECT id, name, platforms, content_types, audio_url, rate_kz_per_1k, budget_total_kz, spent_kz, max_payout_user_kz, max_posts_total, status, category_id FROM campaigns WHERE post_message_id=?",
+                        (post_id,))
             row = cur.fetchone()
             if not row:
                 conn.close()
@@ -1165,8 +1230,7 @@ async def on_interaction(interaction: discord.Interaction):
 
             if not category_id:
                 role_verified = guild.get_role(VERIFICADO_ROLE_ID)
-                bot_member = await get_bot_member(guild)
-                admin_member = await fetch_member_safe(guild, ADMIN_USER_ID)
+                bot_member = await get_bot_member_safe(guild)
 
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -1175,6 +1239,8 @@ async def on_interaction(interaction: discord.Interaction):
                     overwrites[role_verified] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=False)
                 if bot_member:
                     overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True, manage_channels=True, manage_messages=True)
+
+                admin_member = guild.get_member(ADMIN_USER_ID) or await fetch_member_safe(guild, ADMIN_USER_ID)
                 if admin_member:
                     overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True, manage_messages=True)
 
@@ -1316,7 +1382,7 @@ async def on_ready():
         bot.add_view(MainView())
         bot.add_view(IbanButtons())
         bot.add_view(JoinCampaignView())
-        bot.add_view(SuporteView())  # ✅ suporte persistent
+        bot.add_view(SupportPanelView())  # ✅ suporte persistent (2 botões)
         bot._views_added = True
 
     try:
@@ -1324,7 +1390,6 @@ async def on_ready():
         await reattach_submit_panels()
     except Exception as e:
         print("⚠️ Erro ao reanexar views:", e)
-        traceback.print_exc()
 
     if not refresh_views_loop.is_running():
         refresh_views_loop.start()
