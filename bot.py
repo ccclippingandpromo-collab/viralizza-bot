@@ -1302,8 +1302,9 @@ def keep_alive():
 # =========================
 # RUN
 # =========================
-raw = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")
 if not raw:
     raise RuntimeError("DISCORD_TOKEN está vazio/None no Render Environment.")
-TOKEN = raw.strip().strip('"').strip("'")
+
 bot.run(TOKEN)
+
