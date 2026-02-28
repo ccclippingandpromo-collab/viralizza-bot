@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: viralizza-bot
     env: python
     plan: free
@@ -9,4 +9,4 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: DB_PATH
-        value: /var/data/database.sqlite3
+        value: /tmp/database.sqlite3
