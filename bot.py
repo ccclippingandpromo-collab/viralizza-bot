@@ -1316,4 +1316,6 @@ def keep_alive():
 # =========================
 # RUN
 # =========================
+keep_alive()  # ✅ para Web Service (precisa abrir porta)
 bot.run(BOT_TOKEN)
+
