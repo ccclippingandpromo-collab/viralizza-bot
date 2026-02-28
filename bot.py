@@ -23,7 +23,6 @@ def get_bot_token() -> str:
         raise RuntimeError("TOKEN/DISCORD_TOKEN está vazio no Render Environment.")
     print(f"[BOOT] TOKEN length={len(tok)} last4={tok[-4:]}")
     return tok
-
 BOT_TOKEN = get_bot_token()
 
 # =========================
@@ -1276,5 +1275,6 @@ signal.signal(signal.SIGINT, _handle_sigterm)
 # =========================
 keep_alive()
 bot.run(BOT_TOKEN)
+
 
 
