@@ -14,6 +14,19 @@ from discord.ext import commands, tasks
 from flask import Flask
 
 # =========================
+# TOKEN (Render env: TOKEN)
+# =========================
+def get_bot_token() -> str:
+    tok = os.getenv("TOKEN", "").strip()
+    if not tok:
+        raise RuntimeError("TOKEN está vazio/None no Render Environment. Define a env var TOKEN.")
+    # Debug seguro (não mostra token inteiro)
+    print(f"[BOOT] TOKEN length={len(tok)} last4={tok[-4:]}")
+    return tok
+
+BOT_TOKEN = get_bot_token()
+
+# =========================
 # CONFIG (TEUS IDS)
 # =========================
 SERVER_ID = 1473469552917741678
@@ -38,7 +51,7 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/database.sqlite3")
 
 # APIFY (views automáticas)
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
-APIFY_ACTOR = os.getenv("APIFY_ACTOR", "clockworks/tiktok-scraper").strip()  # podes mudar no Render
+APIFY_ACTOR = os.getenv("APIFY_ACTOR", "clockworks/tiktok-scraper").strip()
 VIEWS_REFRESH_MINUTES = int(os.getenv("VIEWS_REFRESH_MINUTES", "10"))
 
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
@@ -419,7 +432,7 @@ def get_campaign_by_id(conn, campaign_id: int):
     return cur.fetchone()
 
 # =========================
-# UI VIEWS (com custom_id únicos por prefix)
+# UI VIEWS (persistent)
 # =========================
 class MainView(discord.ui.View):
     def __init__(self):
@@ -567,7 +580,6 @@ class SubmitVideoModal(discord.ui.Modal):
             conn.close()
             return await _safe_ephemeral(interaction, "⚠️ Este vídeo já foi submetido nesta campanha.")
 
-        # manda para aprovações (staff)
         appr = guild.get_channel(VERIFICACOES_CHANNEL_ID)
         if appr:
             await appr.send(
@@ -732,9 +744,11 @@ async def update_leaderboard_for_campaign(campaign_id: int):
     if not ch:
         return
 
-    lines = [f"🏆 **LEADERBOARD — {name}**",
-             f"💰 **Gasto:** {spent:,}/{budget:,} Kz | 📌 **Estado:** {status}",
-             ""]
+    lines = [
+        f"🏆 **LEADERBOARD — {name}**",
+        f"💰 **Gasto:** {spent:,}/{budget:,} Kz | 📌 **Estado:** {status}",
+        ""
+    ]
     if not top:
         lines.append("Ainda sem pagamentos/atualizações.")
     else:
@@ -757,27 +771,21 @@ async def apify_get_views_for_url(url: str) -> Optional[int]:
         return None
 
     run_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/runs?token={APIFY_TOKEN}"
-    # input comum do clockworks/tiktok-scraper
-    payload = {
-        "startUrls": [{"url": url}],
-        "maxItems": 1
-    }
+    payload = {"startUrls": [{"url": url}], "maxItems": 1}
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(run_url, json=payload) as r:
                 data = await r.json()
-                run = data.get("data", {})
+                run = data.get("data", {}) or {}
                 run_id = run.get("id")
                 dataset_id = run.get("defaultDatasetId")
                 if not run_id or not dataset_id:
                     return None
 
-            # esperar fim (poll)
+            status = None
             for _ in range(20):
-                async with session.get(
-                    f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
-                ) as rr:
+                async with session.get(f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}") as rr:
                     rd = await rr.json()
                     status = (rd.get("data", {}) or {}).get("status")
                     if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
@@ -796,13 +804,9 @@ async def apify_get_views_for_url(url: str) -> Optional[int]:
                 return None
 
             item = items[0]
-            # campos comuns possíveis
-            for key in ("playCount", "play_count", "stats.playCount", "stats.play_count"):
-                # suporte simples
-                if key in item and isinstance(item[key], int):
-                    return item[key]
-            # tenta alternativas
             stats = item.get("stats") or {}
+            if isinstance(item.get("playCount"), int):
+                return item["playCount"]
             if isinstance(stats, dict) and isinstance(stats.get("playCount"), int):
                 return stats["playCount"]
             return None
@@ -838,12 +842,10 @@ async def refresh_views_loop():
             if views is None:
                 continue
 
-            # atualiza views_current sempre
             conn2 = db_conn()
             cur2 = conn2.cursor()
             cur2.execute("UPDATE submissions SET views_current=? WHERE id=?", (int(views), int(sub_id)))
 
-            # pagar só em blocos de 1000
             payable_total = (int(views) // 1000) * 1000
             to_pay_views = payable_total - int(paid_views)
             if to_pay_views < 1000:
@@ -851,10 +853,8 @@ async def refresh_views_loop():
                 conn2.close()
                 continue
 
-            # calcular pagamento e caps
             to_pay_kz = (to_pay_views // 1000) * int(rate)
 
-            # cap por user
             cur2.execute("SELECT COALESCE(paid_kz,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
                          (int(camp_id), int(user_id)))
             rowu = cur2.fetchone()
@@ -865,15 +865,12 @@ async def refresh_views_loop():
                 conn2.close()
                 continue
             if to_pay_kz > remaining_user_kz:
-                # reduz views a pagar para caber
                 max_blocks = remaining_user_kz // int(rate)
                 to_pay_views = max_blocks * 1000
                 to_pay_kz = max_blocks * int(rate)
 
-            # cap por budget
             remaining_budget = max(0, int(budget_total) - int(spent_kz))
             if remaining_budget <= 0:
-                # fecha campanha
                 cur2.execute("UPDATE campaigns SET status='ended' WHERE id=?", (int(camp_id),))
                 conn2.commit()
                 conn2.close()
@@ -889,7 +886,6 @@ async def refresh_views_loop():
                 conn2.close()
                 continue
 
-            # aplica pagamento
             cur2.execute("""
             INSERT INTO campaign_users (campaign_id, user_id, paid_kz, total_views_paid)
             VALUES (?, ?, ?, ?)
@@ -908,7 +904,6 @@ async def refresh_views_loop():
             conn2.close()
             touched_campaigns.add(int(camp_id))
 
-        # atualizar leaderboards tocados
         for cid in touched_campaigns:
             await update_leaderboard_for_campaign(cid)
 
@@ -925,6 +920,7 @@ async def before_refresh_views():
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     try:
+        # deixa comandos / outros tipos passarem
         if interaction.type != discord.InteractionType.component:
             return await bot.process_application_commands(interaction)
 
@@ -935,6 +931,7 @@ async def on_interaction(interaction: discord.Interaction):
 
         # ---------- VERIFICAÇÃO ----------
         if cid == "vz:connect":
+            # envia UM reply com select (sem tuplas / sem followup bugado)
             v = discord.ui.View(timeout=120)
             select = discord.ui.Select(
                 placeholder="Escolhe a rede social",
@@ -945,13 +942,20 @@ async def on_interaction(interaction: discord.Interaction):
                 ],
                 custom_id="vz:social_select"
             )
+
             async def _sel_callback(i: discord.Interaction):
                 social = (i.data["values"][0] if i.data and "values" in i.data else "TikTok")
                 code = generate_verification_code()
                 await i.response.send_modal(UsernameModal(social=social, code=code))
+
             select.callback = _sel_callback
             v.add_item(select)
-            return await _safe_ephemeral(interaction, "Escolhe a rede social:"), await interaction.followup.send(" ", view=v, ephemeral=True)
+
+            if interaction.response.is_done():
+                await interaction.followup.send("Escolhe a rede social:", view=v, ephemeral=True)
+            else:
+                await interaction.response.send_message("Escolhe a rede social:", view=v, ephemeral=True)
+            return
 
         if cid == "vz:view_account":
             row = get_verification_request(interaction.user.id)
@@ -1016,7 +1020,10 @@ async def on_interaction(interaction: discord.Interaction):
                     fallback_channel_id=LIGAR_CONTA_E_VERIFICAR_CHANNEL_ID
                 )
                 try:
-                    await interaction.message.edit(content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **APROVADO ✅**"), view=None)
+                    await interaction.message.edit(
+                        content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **APROVADO ✅**"),
+                        view=None
+                    )
                 except:
                     pass
                 return await _safe_ephemeral(interaction, "✅ Aprovado e cargo atribuído.")
@@ -1032,7 +1039,10 @@ async def on_interaction(interaction: discord.Interaction):
                     fallback_channel_id=LIGAR_CONTA_E_VERIFICAR_CHANNEL_ID
                 )
                 try:
-                    await interaction.message.edit(content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **REJEITADO ❌**"), view=None)
+                    await interaction.message.edit(
+                        content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **REJEITADO ❌**"),
+                        view=None
+                    )
                 except:
                     pass
                 return await _safe_ephemeral(interaction, "❌ Rejeitado.")
@@ -1236,7 +1246,10 @@ async def on_interaction(interaction: discord.Interaction):
                 conn.commit()
                 conn.close()
                 try:
-                    await interaction.message.edit(content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **APROVADO ✅**"), view=None)
+                    await interaction.message.edit(
+                        content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **APROVADO ✅**"),
+                        view=None
+                    )
                 except:
                     pass
                 return await _safe_ephemeral(interaction, "✅ Vídeo aprovado.")
@@ -1246,7 +1259,10 @@ async def on_interaction(interaction: discord.Interaction):
                 conn.commit()
                 conn.close()
                 try:
-                    await interaction.message.edit(content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **REJEITADO ❌**"), view=None)
+                    await interaction.message.edit(
+                        content=interaction.message.content.replace("📌 Status: **PENDENTE**", "📌 Status: **REJEITADO ❌**"),
+                        view=None
+                    )
                 except:
                     pass
                 return await _safe_ephemeral(interaction, "❌ Vídeo rejeitado.")
@@ -1261,7 +1277,6 @@ async def on_interaction(interaction: discord.Interaction):
 async def on_ready():
     init_db()
 
-    # views persistentes (as base)
     if not getattr(bot, "_views_added", False):
         bot.add_view(MainView())
         bot.add_view(IbanButtons())
@@ -1296,15 +1311,9 @@ def keep_alive():
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-# (no Render worker não precisas, mas não atrapalha)
-# keep_alive()
+# keep_alive()  # opcional
 
 # =========================
 # RUN
 # =========================
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not raw:
-    raise RuntimeError("DISCORD_TOKEN está vazio/None no Render Environment.")
-
-bot.run(TOKEN)
-
+bot.run(BOT_TOKEN)
