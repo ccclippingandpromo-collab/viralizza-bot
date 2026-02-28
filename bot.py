@@ -141,7 +141,7 @@ async def notify_user(member: discord.Member, content: str, fallback_channel_id:
 
 
 # =========================
-# DB INIT
+# DB INIT + MIGRATIONS
 # =========================
 def init_db():
     conn = db_conn()
@@ -242,6 +242,17 @@ def init_db():
         PRIMARY KEY (campaign_id, user_id)
     )
     """)
+
+    # ---- MIGRATIONS (para botões persistirem após restart)
+    # Guardar a msg/canal de aprovação do vídeo para reanexar a view no on_ready
+    try:
+        cur.execute("ALTER TABLE submissions ADD COLUMN approve_channel_id INTEGER;")
+    except:
+        pass
+    try:
+        cur.execute("ALTER TABLE submissions ADD COLUMN approve_message_id INTEGER;")
+    except:
+        pass
 
     conn.commit()
     conn.close()
@@ -459,8 +470,54 @@ def get_campaign_by_id(conn, campaign_id: int):
     return cur.fetchone()
 
 
+async def update_leaderboard(campaign_id: int):
+    """Atualiza a mensagem do leaderboard (conta views_current de vídeos aprovados)."""
+    guild = bot.get_guild(SERVER_ID)
+    if not guild:
+        return
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT leaderboard_channel_id, leaderboard_message_id, name FROM campaigns WHERE id=?", (campaign_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+
+    lb_ch_id, lb_msg_id, cname = row
+    if not lb_ch_id or not lb_msg_id:
+        conn.close()
+        return
+
+    cur.execute("""
+        SELECT user_id, COALESCE(SUM(views_current),0) AS v
+        FROM submissions
+        WHERE campaign_id=? AND status IN ('approved','frozen')
+        GROUP BY user_id
+        ORDER BY v DESC
+        LIMIT 10
+    """, (campaign_id,))
+    top = cur.fetchall()
+    conn.close()
+
+    lines = []
+    for i, (uid, v) in enumerate(top, start=1):
+        lines.append(f"**{i}.** <@{uid}> — **{int(v):,}** views")
+
+    text = f"🏆 **LEADERBOARD — {cname}**\n\n" + ("\n".join(lines) if lines else "Ainda sem vídeos aprovados.")
+
+    try:
+        ch = guild.get_channel(int(lb_ch_id))
+        if not ch:
+            return
+        msg = await ch.fetch_message(int(lb_msg_id))
+        await msg.edit(content=text)
+    except:
+        pass
+
+
 # =========================
-# CAMPANHAS: SUBMISSÃO (FUNCIONAL)
+# CAMPANHAS: SUBMISSÃO
 # =========================
 class SubmitVideoModal(discord.ui.Modal):
     def __init__(self, campaign_id: int):
@@ -511,7 +568,7 @@ class SubmitVideoModal(discord.ui.Modal):
             conn.close()
             return await _safe_ephemeral(interaction, "⚠️ Este vídeo já foi submetido nesta campanha.")
 
-        # manda para aprovações (staff)
+        # manda para aprovações (staff) + guarda a msg para reanexar botões pós-restart
         appr = guild.get_channel(VERIFICACOES_CHANNEL_ID)
         if appr:
             view = VideoApprovalView(
@@ -519,7 +576,7 @@ class SubmitVideoModal(discord.ui.Modal):
                 submitter_id=interaction.user.id,
                 tiktok_url=url
             )
-            await appr.send(
+            msg_appr = await appr.send(
                 f"📥 **Novo vídeo submetido**\n"
                 f"🎯 Campanha ID: `{self.campaign_id}`\n"
                 f"👤 User: {interaction.user.mention} (`{interaction.user.id}`)\n"
@@ -528,14 +585,20 @@ class SubmitVideoModal(discord.ui.Modal):
                 view=view
             )
 
+            cur.execute("""
+                UPDATE submissions
+                SET approve_channel_id=?, approve_message_id=?
+                WHERE campaign_id=? AND user_id=? AND tiktok_url=?
+            """, (appr.id, msg_appr.id, self.campaign_id, interaction.user.id, url))
+            conn.commit()
+
         conn.close()
         await _safe_ephemeral(interaction, "✅ Vídeo submetido! Aguarda aprovação do staff.")
 
 
 class SubmitView(discord.ui.View):
     """
-    ✅ Sem router on_interaction.
-    ✅ Callbacks nativos => botões funcionam.
+    ✅ Callbacks nativos (botões funcionam).
     """
     def __init__(self, campaign_id: int):
         super().__init__(timeout=None)
@@ -613,6 +676,8 @@ class VideoApprovalView(discord.ui.View):
         interaction, _ = _safe_button_pair(a, b)
         if not interaction:
             return
+        await interaction.response.defer(ephemeral=True)
+
         if not await self._only_admin(interaction):
             return
 
@@ -637,13 +702,16 @@ class VideoApprovalView(discord.ui.View):
         except:
             pass
 
-        await _safe_ephemeral(interaction, "✅ Vídeo aprovado.")
+        await update_leaderboard(self.campaign_id)
+        await interaction.followup.send("✅ Vídeo aprovado.", ephemeral=True)
 
     @discord.ui.button(label="❌ Rejeitar vídeo", style=discord.ButtonStyle.red, custom_id="camp_reject_video")
     async def reject(self, a, b):
         interaction, _ = _safe_button_pair(a, b)
         if not interaction:
             return
+        await interaction.response.defer(ephemeral=True)
+
         if not await self._only_admin(interaction):
             return
 
@@ -667,11 +735,11 @@ class VideoApprovalView(discord.ui.View):
         except:
             pass
 
-        await _safe_ephemeral(interaction, "❌ Vídeo rejeitado.")
+        await interaction.followup.send("❌ Vídeo rejeitado.", ephemeral=True)
 
 
 # =========================
-# CAMPANHAS: JOIN (FUNCIONAL)
+# CAMPANHAS: JOIN
 # =========================
 class JoinCampaignView(discord.ui.View):
     def __init__(self):
@@ -682,14 +750,15 @@ class JoinCampaignView(discord.ui.View):
         interaction, _ = _safe_button_pair(a, b)
         if not interaction:
             return
+        await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild or bot.get_guild(SERVER_ID)
         if not guild:
-            return await _safe_ephemeral(interaction, "⚠️ Servidor não encontrado.")
+            return await interaction.followup.send("⚠️ Servidor não encontrado.", ephemeral=True)
 
         member = await fetch_member_safe(guild, interaction.user.id)
         if not member or not is_verified(member):
-            return await _safe_ephemeral(interaction, "⛔ Tens de estar **Verificado** para aderir.")
+            return await interaction.followup.send("⛔ Tens de estar **Verificado** para aderir.", ephemeral=True)
 
         post_id = interaction.message.id
 
@@ -709,10 +778,9 @@ class JoinCampaignView(discord.ui.View):
 
         if not row:
             conn.close()
-            return await _safe_ephemeral(
-                interaction,
-                "❌ Campanha não encontrada na base de dados.\n"
-                "➡️ Admin: republica a campanha com `!campanha`."
+            return await interaction.followup.send(
+                "❌ Campanha não encontrada na base de dados.\n➡️ Admin: republica a campanha com `!campanha`.",
+                ephemeral=True
             )
 
         (cid, name, platforms, content_types, audio_url,
@@ -724,7 +792,7 @@ class JoinCampaignView(discord.ui.View):
 
         if status != "active":
             conn.close()
-            return await _safe_ephemeral(interaction, "⚠️ Esta campanha já terminou.")
+            return await interaction.followup.send("⚠️ Esta campanha já terminou.", ephemeral=True)
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -759,10 +827,9 @@ class JoinCampaignView(discord.ui.View):
                 lb_ch = await guild.create_text_channel("4-leaderboard", category=category, overwrites=overwrites)
             except discord.Forbidden:
                 conn.close()
-                return await _safe_ephemeral(
-                    interaction,
-                    "⛔ Falta permissão ao bot para criar categoria/canais.\n"
-                    "✅ Dá ao bot: **Manage Channels**."
+                return await interaction.followup.send(
+                    "⛔ Falta permissão ao bot para criar categoria/canais.\n✅ Dá ao bot: **Manage Channels**.",
+                    ephemeral=True
                 )
 
             c = {
@@ -783,7 +850,7 @@ class JoinCampaignView(discord.ui.View):
                 "📤 **Submete os teus vídeos aqui**\n\nUsa os botões abaixo 👇",
                 view=SubmitView(campaign_id=cid)
             )
-            lb_msg = await lb_ch.send("🏆 **LEADERBOARD**\n*(por agora sem atualização automática)*")
+            lb_msg = await lb_ch.send(f"🏆 **LEADERBOARD — {name}**\n*(a contar views_current dos aprovados)*")
 
             cur.execute("""
                 UPDATE campaigns SET
@@ -799,7 +866,7 @@ class JoinCampaignView(discord.ui.View):
             conn.commit()
 
         conn.close()
-        await _safe_ephemeral(interaction, "✅ Aderiste à campanha! Vai à categoria da campanha para submeter.")
+        await interaction.followup.send("✅ Aderiste à campanha! Vai à categoria da campanha para submeter.", ephemeral=True)
 
 
 # =========================
@@ -1066,37 +1133,39 @@ class ApprovalView(discord.ui.View):
         interaction, _ = _safe_button_pair(a, b)
         if not interaction:
             return
+        await interaction.response.defer(ephemeral=True)
+
         if not await self._only_admin(interaction):
             return
 
         row = get_verification_request(self.target_user_id)
         if not row:
-            return await _safe_ephemeral(interaction, "⚠️ Este pedido já não existe no DB.")
+            return await interaction.followup.send("⚠️ Este pedido já não existe no DB.", ephemeral=True)
 
         _, social, username, code, status, _, _ = row
         if status != "pending":
-            return await _safe_ephemeral(interaction, f"⚠️ Pedido já está como **{status}**.")
+            return await interaction.followup.send(f"⚠️ Pedido já está como **{status}**.", ephemeral=True)
 
         guild = bot.get_guild(SERVER_ID)
         if not guild:
-            return await _safe_ephemeral(interaction, "⚠️ Guild não encontrada.")
+            return await interaction.followup.send("⚠️ Guild não encontrada.", ephemeral=True)
 
         member = await fetch_member_safe(guild, self.target_user_id)
         if not member:
-            return await _safe_ephemeral(interaction, "⚠️ Não consegui buscar o membro.")
+            return await interaction.followup.send("⚠️ Não consegui buscar o membro.", ephemeral=True)
 
         role = guild.get_role(VERIFICADO_ROLE_ID)
         if not role:
-            return await _safe_ephemeral(interaction, "⚠️ Cargo 'Verificado' não encontrado.")
+            return await interaction.followup.send("⚠️ Cargo 'Verificado' não encontrado.", ephemeral=True)
 
         try:
             await member.add_roles(role, reason="Verificação aprovada")
         except discord.Forbidden:
-            return await _safe_ephemeral(
-                interaction,
+            return await interaction.followup.send(
                 "⛔ Sem permissões para dar cargo.\n"
                 "1) Dá ao bot **Manage Roles**.\n"
-                "2) Cargo do bot acima de **Verificado**."
+                "2) Cargo do bot acima de **Verificado**.",
+                ephemeral=True
             )
 
         set_verification_status(self.target_user_id, "verified")
@@ -1121,19 +1190,21 @@ class ApprovalView(discord.ui.View):
         except:
             pass
 
-        await _safe_ephemeral(interaction, "✅ Aprovado e cargo atribuído.")
+        await interaction.followup.send("✅ Aprovado e cargo atribuído.", ephemeral=True)
 
     @discord.ui.button(label="❌ Rejeitar", style=discord.ButtonStyle.red, custom_id="reject_btn")
     async def reject(self, a, b):
         interaction, _ = _safe_button_pair(a, b)
         if not interaction:
             return
+        await interaction.response.defer(ephemeral=True)
+
         if not await self._only_admin(interaction):
             return
 
         row = get_verification_request(self.target_user_id)
         if not row:
-            return await _safe_ephemeral(interaction, "⚠️ Este pedido já não existe no DB.")
+            return await interaction.followup.send("⚠️ Este pedido já não existe no DB.", ephemeral=True)
 
         _, social, username, code, status, _, _ = row
         set_verification_status(self.target_user_id, "rejected")
@@ -1161,7 +1232,7 @@ class ApprovalView(discord.ui.View):
         except:
             pass
 
-        await _safe_ephemeral(interaction, "❌ Rejeitado.")
+        await interaction.followup.send("❌ Rejeitado.", ephemeral=True)
 
 
 # =========================
@@ -1292,8 +1363,36 @@ async def reattach_submit_panels():
             if not submit_ch:
                 continue
             msg = await submit_ch.fetch_message(int(panel_msg_id))
-            # reanexa o painel com botões funcionais
             await msg.edit(view=SubmitView(int(cid)))
+        except:
+            pass
+
+
+async def reattach_pending_video_approval_views():
+    """Reanexa botões Aprovar/Rejeitar para vídeos pendentes após restart/deploy."""
+    guild = bot.get_guild(SERVER_ID)
+    if not guild:
+        return
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT campaign_id, user_id, tiktok_url, approve_channel_id, approve_message_id
+        FROM submissions
+        WHERE status='pending'
+          AND approve_channel_id IS NOT NULL
+          AND approve_message_id IS NOT NULL
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    for campaign_id, user_id, tiktok_url, ch_id, msg_id in rows:
+        try:
+            ch = guild.get_channel(int(ch_id))
+            if not ch:
+                continue
+            msg = await ch.fetch_message(int(msg_id))
+            await msg.edit(view=VideoApprovalView(int(campaign_id), int(user_id), str(tiktok_url)))
         except:
             pass
 
@@ -1313,6 +1412,7 @@ async def on_ready():
     try:
         await reattach_pending_verification_views()
         await reattach_submit_panels()
+        await reattach_pending_video_approval_views()
     except Exception as e:
         print("⚠️ Erro ao reanexar views:", e)
 
@@ -1320,7 +1420,7 @@ async def on_ready():
 
 
 # =========================
-# WEB (keep alive)
+# WEB (keep alive) - opcional
 # =========================
 app = Flask(__name__)
 
@@ -1328,35 +1428,28 @@ app = Flask(__name__)
 def home():
     return "Viralizza Bot is running!"
 
-
 def run_web():
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-
 
 def keep_alive():
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
+# (Se estiveres a usar Background Worker no Render, não precisas disto.)
+# keep_alive()
+
 
 # =========================
-# RUN
+# RUN (CORRIGIDO)
 # =========================
-import os
-
 raw = os.getenv("DISCORD_TOKEN")
-print("DISCORD_TOKEN raw repr:", repr(raw))
-
 if not raw:
     raise RuntimeError("DISCORD_TOKEN está vazio/None no Render Environment.")
 
 TOKEN = raw.strip().strip('"').strip("'")
 
-print("TOKEN len:", len(TOKEN))
-print("TOKEN dots:", TOKEN.count("."))
-print("TOKEN has_whitespace:", any(c.isspace() for c in TOKEN))
-print("TOKEN head/tail:", TOKEN[:8], "...", TOKEN[-8:])
+# NÃO imprimir token no log (segurança)
+# print("TOKEN len:", len(TOKEN))
 
-bot.run("Token")
-
-
+bot.run(TOKEN)
