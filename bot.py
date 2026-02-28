@@ -18,9 +18,9 @@ from flask import Flask
 # TOKEN (Render env: TOKEN)
 # =========================
 def get_bot_token() -> str:
-    tok = os.getenv("TOKEN", "").strip()
+    tok = os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN") or "").strip()
     if not tok:
-        raise RuntimeError("TOKEN está vazio/None no Render Environment. Define a env var TOKEN.")
+        raise RuntimeError("TOKEN está vazio/None no Render Environment.") 
     print(f"[BOOT] TOKEN length={len(tok)} last4={tok[-4:]}")
     return tok
 
@@ -1276,3 +1276,4 @@ signal.signal(signal.SIGINT, _handle_sigterm)
 # =========================
 keep_alive()
 bot.run(BOT_TOKEN)
+
