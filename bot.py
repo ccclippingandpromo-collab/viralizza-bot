@@ -2,14 +2,17 @@ import os
 import re
 import time
 import sqlite3
+import threading
 import asyncio
 import secrets
 import string
+import signal
 from typing import Optional
 
 import aiohttp
 import discord
 from discord.ext import commands, tasks
+from flask import Flask
 
 # =========================
 # TOKEN (Render env: TOKEN)
@@ -43,15 +46,14 @@ SUPORTE_STAFF_CHANNEL_ID = 1474938549181874320
 VERIFICADO_ROLE_ID = 1473886534439538699
 ADMIN_USER_ID = 1376499031890460714
 
-# DB (Render env: DB_PATH)
-# No FREE/worker sem disk, usa /tmp
-DB_PATH = os.getenv("DB_PATH", "/tmp/database.sqlite3").strip()
+# DB (Render Disk -> /var/data)
+DB_PATH = os.getenv("DB_PATH", "/var/data/database.sqlite3").strip()
 
 # APIFY (views automáticas)
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
 APIFY_ACTOR_TIKTOK = os.getenv("APIFY_ACTOR_TIKTOK", "clockworks/tiktok-scraper").strip()
 APIFY_ACTOR_INSTAGRAM = os.getenv("APIFY_ACTOR_INSTAGRAM", "apify/instagram-scraper").strip()
-VIEWS_REFRESH_MINUTES = int(os.getenv("VIEWS_REFRESH_MINUTES", "10"))
+VIEWS_REFRESH_MINUTES = int(os.getenv("VIEWS_REFRESH_MINUTES", "10").strip() or "10")
 
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
 print("DB_PATH:", DB_PATH)
@@ -67,6 +69,27 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# =========================
+# HTTP SESSION (GLOBAL) - evita "Unclosed client session"
+# =========================
+HTTP_SESSION: Optional[aiohttp.ClientSession] = None
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global HTTP_SESSION
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        timeout = aiohttp.ClientTimeout(total=45)
+        HTTP_SESSION = aiohttp.ClientSession(timeout=timeout)
+    return HTTP_SESSION
+
+async def close_http_session():
+    global HTTP_SESSION
+    try:
+        if HTTP_SESSION and not HTTP_SESSION.closed:
+            await HTTP_SESSION.close()
+    except Exception:
+        pass
+    HTTP_SESSION = None
 
 # =========================
 # HELPERS
@@ -90,10 +113,6 @@ def generate_verification_code() -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "VZ-" + "".join(secrets.choice(alphabet) for _ in range(7))
 
-def tiktok_extract_video_id(url: str):
-    m = re.search(r"/video/(\d+)", url)
-    return m.group(1) if m else None
-
 def is_verified(member: discord.Member) -> bool:
     role = member.guild.get_role(VERIFICADO_ROLE_ID)
     return bool(role) and (role in member.roles)
@@ -114,12 +133,7 @@ async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True):
     except Exception:
         pass
 
-async def safe_reply(
-    interaction: discord.Interaction,
-    content: str,
-    ephemeral: bool = True,
-    view: Optional[discord.ui.View] = None
-):
+async def safe_reply(interaction: discord.Interaction, content: str, ephemeral: bool = True, view: Optional[discord.ui.View] = None):
     try:
         if interaction.response.is_done():
             await interaction.followup.send(content, ephemeral=ephemeral, view=view)
@@ -321,7 +335,7 @@ def list_pending_verifications():
     return rows
 
 # =========================
-# CAMPANHA TESTE
+# CAMPANHA TESTE (a tua)
 # =========================
 TREEZY_TEST_CAMPAIGN = {
     "name": "Treezy Flacko – Kwarran",
@@ -720,7 +734,7 @@ async def update_leaderboard_for_campaign(campaign_id: int):
         pass
 
 # =========================
-# APIFY: obter views (TikTok + Instagram)
+# APIFY: obter views
 # =========================
 async def apify_run(actor: str, payload: dict) -> Optional[dict]:
     if not APIFY_TOKEN:
@@ -728,41 +742,44 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
 
     run_url = f"https://api.apify.com/v2/acts/{actor}/runs?token={APIFY_TOKEN}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(run_url, json=payload) as r:
-                data = await r.json()
-                run = data.get("data", {}) or {}
-                run_id = run.get("id")
-                dataset_id = run.get("defaultDatasetId")
-                if not run_id or not dataset_id:
-                    return None
+        session = await get_http_session()
 
-            status = None
-            for _ in range(25):
-                async with session.get(f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}") as rr:
-                    rd = await rr.json()
-                    status = (rd.get("data", {}) or {}).get("status")
-                    if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-                        break
-                await asyncio.sleep(2)
-
-            if status != "SUCCEEDED":
+        async with session.post(run_url, json=payload) as r:
+            data = await r.json()
+            run = data.get("data", {}) or {}
+            run_id = run.get("id")
+            dataset_id = run.get("defaultDatasetId")
+            if not run_id or not dataset_id:
                 return None
 
-            async with session.get(
-                f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&clean=true&limit=1"
-            ) as ri:
-                items = await ri.json()
+        status = None
+        for _ in range(25):
+            async with session.get(f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}") as rr:
+                rd = await rr.json()
+                status = (rd.get("data", {}) or {}).get("status")
+                if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                    break
+            await asyncio.sleep(2)
 
-            if not items or not isinstance(items, list):
-                return None
+        if status != "SUCCEEDED":
+            return None
 
-            return items[0]
+        async with session.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&clean=true&limit=1"
+        ) as ri:
+            items = await ri.json()
+
+        if not items or not isinstance(items, list):
+            return None
+
+        return items[0]
     except Exception as e:
         print("⚠️ APIFY erro:", e)
         return None
 
 def extract_views_from_item(item: dict) -> Optional[int]:
+    if not item or not isinstance(item, dict):
+        return None
     candidates = [
         "playCount", "plays", "views", "viewCount", "videoViewCount", "video_view_count",
         "videoPlayCount", "video_play_count"
@@ -782,7 +799,6 @@ def extract_views_from_item(item: dict) -> Optional[int]:
                 return v
             if isinstance(v, str) and v.isdigit():
                 return int(v)
-
     return None
 
 async def apify_get_views_for_url(url: str) -> Optional[int]:
@@ -792,11 +808,7 @@ async def apify_get_views_for_url(url: str) -> Optional[int]:
         return extract_views_from_item(item) if item else None
 
     if platform == "instagram":
-        payload = {
-            "directUrls": [url],
-            "resultsType": "posts",
-            "resultsLimit": 1
-        }
+        payload = {"directUrls": [url], "resultsType": "posts", "resultsLimit": 1}
         item = await apify_run(APIFY_ACTOR_INSTAGRAM, payload)
         return extract_views_from_item(item) if item else None
 
@@ -918,15 +930,16 @@ async def on_interaction(interaction: discord.Interaction):
         if not cid:
             return
 
-        # -------- CONNECT --------
+        # -------- CONNECT (FIX: agora envia VIEW) --------
         if cid == "vz:connect":
             view = discord.ui.View(timeout=120)
+
             select = discord.ui.Select(
                 placeholder="Escolhe a rede social",
                 options=[
-                    discord.SelectOption(label="TikTok", emoji="🎵"),
-                    discord.SelectOption(label="Instagram", emoji="📸"),
-                    discord.SelectOption(label="YouTube", emoji="📺"),
+                    discord.SelectOption(label="TikTok", emoji="🎵", value="TikTok"),
+                    discord.SelectOption(label="Instagram", emoji="📸", value="Instagram"),
+                    discord.SelectOption(label="YouTube", emoji="📺", value="YouTube"),
                 ],
             )
 
@@ -938,7 +951,6 @@ async def on_interaction(interaction: discord.Interaction):
             select.callback = _cb
             view.add_item(select)
 
-            # ✅ BUG FIX: agora manda a view com o select
             return await safe_reply(interaction, "Escolhe a rede social:", ephemeral=True, view=view)
 
         if cid == "vz:view_account":
@@ -1047,11 +1059,8 @@ async def on_interaction(interaction: discord.Interaction):
             post_id = interaction.message.id
             conn = db_conn()
             cur = conn.cursor()
-            cur.execute(
-                "SELECT id, name, platforms, content_types, audio_url, rate_kz_per_1k, budget_total_kz, spent_kz, max_payout_user_kz, max_posts_total, status, category_id "
-                "FROM campaigns WHERE post_message_id=?",
-                (post_id,)
-            )
+            cur.execute("SELECT id, name, platforms, content_types, audio_url, rate_kz_per_1k, budget_total_kz, spent_kz, max_payout_user_kz, max_posts_total, status, category_id FROM campaigns WHERE post_message_id=?",
+                        (post_id,))
             row = cur.fetchone()
             if not row:
                 conn.close()
@@ -1062,7 +1071,6 @@ async def on_interaction(interaction: discord.Interaction):
                 conn.close()
                 return await safe_reply(interaction, "⚠️ Esta campanha já terminou.", ephemeral=True)
 
-            # cria categoria e canais 1 vez
             if not category_id:
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -1224,22 +1232,47 @@ async def on_ready():
     print(f"✅ Bot ligado como {bot.user}!")
 
 # =========================
-# RUN (anti-429 loop)
+# WEB (opcional)
 # =========================
-async def runner():
-    backoff = 30
-    while True:
-        try:
-            await bot.start(BOT_TOKEN)
-        except discord.HTTPException as e:
-            # se bater 429 / rate limit, não crasha em loop
-            print(f"❌ HTTPException no login: {e}")
-            print(f"⏳ Vou esperar {backoff}s e tentar de novo (sem crashar o Render).")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 1800)  # até 30 min
-        except Exception as e:
-            print(f"❌ Erro fatal: {e}")
-            await asyncio.sleep(30)
+app = Flask(__name__)
 
-if __name__ == "__main__":
-    asyncio.run(runner())
+@app.get("/")
+def home():
+    return "Viralizza Bot is running!"
+
+def run_web():
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
+
+def keep_alive():
+    t = threading.Thread(target=run_web, daemon=True)
+    t.start()
+
+# =========================
+# GRACEFUL SHUTDOWN (Render)
+# =========================
+async def _graceful_shutdown():
+    try:
+        await close_http_session()
+    except Exception:
+        pass
+    try:
+        await bot.close()
+    except Exception:
+        pass
+
+def _handle_sigterm(*_):
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_graceful_shutdown())
+    except Exception:
+        pass
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+signal.signal(signal.SIGINT, _handle_sigterm)
+
+# =========================
+# RUN
+# =========================
+keep_alive()
+bot.run(BOT_TOKEN)
