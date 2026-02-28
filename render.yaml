@@ -5,3 +5,12 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DB_PATH
+        value: /var/data/database.sqlite3
+    disk:
+      name: viralizza-data
+      mountPath: /var/data
+      sizeGB: 10
