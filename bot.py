@@ -241,7 +241,6 @@ def parse_human_number(v: str) -> Optional[int]:
     s = str(v).strip().upper().replace(",", "")
     m = re.match(r"^(\d+(\.\d+)?)([KM])?$", s)
     if not m:
-        # tenta só dígitos
         digits = re.sub(r"[^\d]", "", s)
         return int(digits) if digits.isdigit() else None
     num = float(m.group(1))
@@ -779,10 +778,19 @@ class SubmitLinkModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, "❌ Campanha não encontrada.", ephemeral=True)
 
-        (camp_id, name, slug, platforms, content_types, audio_url,
-         rate, budget_total, spent_kz,
-         max_user_kz, max_posts_total, status,
-         _, _, _, _, _, _, _, _, _, _, _) = row
+        # ✅ FIX CRÍTICO: não desempacotar 23 vars quando o SELECT devolve 22 colunas
+        camp_id        = int(row[0])
+        name           = str(row[1])
+        slug           = str(row[2])
+        platforms      = str(row[3])
+        content_types  = str(row[4])
+        audio_url      = str(row[5] or "")
+        rate           = int(row[6])
+        budget_total   = int(row[7])
+        spent_kz       = int(row[8])
+        max_user_kz    = int(row[9])
+        max_posts_total= int(row[10])
+        status         = str(row[11])
 
         if status != "active":
             conn.close()
@@ -792,7 +800,6 @@ class SubmitLinkModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, "⚠️ Campanha está **quase cheia (95%)**. Submissões fechadas.", ephemeral=True)
 
-        # limite do user
         cur = conn.cursor()
         cur.execute("SELECT COALESCE(paid_kz,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
                     (int(camp_id), interaction.user.id))
@@ -823,6 +830,8 @@ class SubmitLinkModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, f"⚠️ Esta campanha já atingiu o máximo de posts (**{max_posts_total}**).", ephemeral=True)
 
+        # ✅ Já tinhas isto: impede submeter o mesmo vídeo
+        # UNIQUE(campaign_id, post_url) + IntegrityError
         now = _now()
         try:
             cur.execute("""
@@ -1150,7 +1159,6 @@ async def update_leaderboard_for_campaign(campaign_id: int):
 
     lb_ch_id, lb_msg_id, name, spent, budget, status, rate = camp
 
-    # agrega views atuais por user (approved)
     cur.execute("""
     SELECT s.user_id,
            COALESCE(SUM(s.views_current),0) AS views_current_sum,
@@ -1208,6 +1216,10 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
         session = await get_http_session()
 
         async with session.post(run_url, json=payload) as r:
+            if r.status >= 400:
+                txt = await r.text()
+                print(f"⚠️ APIFY POST status={r.status} actor={actor} body={txt[:500]}")
+                return None
             data = await r.json()
             run = data.get("data", {}) or {}
             run_id = run.get("id")
@@ -1219,6 +1231,10 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
         status = None
         for _ in range(30):
             async with session.get(f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}") as rr:
+                if rr.status >= 400:
+                    txt = await rr.text()
+                    print(f"⚠️ APIFY RUN status={rr.status} body={txt[:500]}")
+                    return None
                 rd = await rr.json()
                 status = (rd.get("data", {}) or {}).get("status")
                 if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
@@ -1232,6 +1248,10 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
         async with session.get(
             f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&clean=true&limit=1"
         ) as ri:
+            if ri.status >= 400:
+                txt = await ri.text()
+                print(f"⚠️ APIFY DATASET status={ri.status} body={txt[:500]}")
+                return None
             items = await ri.json()
 
         if not items or not isinstance(items, list):
@@ -1330,7 +1350,7 @@ async def refresh_views_once() -> None:
         if to_pay_views < 1000:
             conn2.commit()
             conn2.close()
-            touched_campaigns.add(int(camp_id))  # ainda assim atualiza leaderboard
+            touched_campaigns.add(int(camp_id))
             continue
 
         to_pay_kz = (to_pay_views // 1000) * int(rate)
@@ -1406,7 +1426,6 @@ async def refresh_views_once() -> None:
                     )
                     set_maxed_notified(int(camp_id), int(user_id))
 
-    # update leaderboards mesmo que não tenha pago (para mostrar views atuais)
     for cid in touched_campaigns:
         await update_leaderboard_for_campaign(int(cid))
 
@@ -1509,7 +1528,6 @@ async def on_interaction(interaction: discord.Interaction):
 
                 set_verification_status(user_id, "verified")
 
-                # DM IMEDIATA COM PAINEL IBAN
                 await notify_user(
                     member,
                     "✅ **Verificação aprovada!**\n\n👉 Agora adiciona o teu IBAN (botões abaixo):",
@@ -1615,7 +1633,6 @@ async def on_interaction(interaction: discord.Interaction):
                 traceback.print_exc()
                 return await safe_reply(interaction, "⚠️ Aderiste, mas falhei a criar a categoria/canais (vê logs/permissões).", ephemeral=True)
 
-            # atualiza leaderboard logo
             await update_leaderboard_for_campaign(int(camp_id))
             return await safe_reply(interaction, f"✅ Aderiste! Agora tens acesso à categoria: <#{cat_id}>", ephemeral=True)
 
@@ -1712,6 +1729,17 @@ async def on_interaction(interaction: discord.Interaction):
             if action == "approve":
                 cur.execute("UPDATE submissions SET status='approved', approved_at=? WHERE id=?", (_now(), sub_id))
                 conn.commit()
+
+                # ✅ EXTRA: tenta buscar views já na aprovação (se o teu vídeo tem 100k, vais ver logo quando der)
+                initial_views = None
+                if APIFY_TOKEN:
+                    try:
+                        initial_views = await apify_get_views_for_url(url)
+                    except:
+                        initial_views = None
+                if isinstance(initial_views, int) and initial_views >= 0:
+                    cur.execute("UPDATE submissions SET views_current=? WHERE id=?", (int(initial_views), sub_id))
+                    conn.commit()
 
                 cur.execute("SELECT name FROM campaigns WHERE id=?", (int(camp_id),))
                 campname = (cur.fetchone() or ["Campanha"])[0]
