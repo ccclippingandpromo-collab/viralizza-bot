@@ -8,7 +8,8 @@ import secrets
 import string
 import signal
 import traceback
-from typing import Optional, List
+from typing import Optional, List, Any, Dict, Tuple
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import discord
@@ -52,10 +53,7 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/database.sqlite3").strip()
 
 # APIFY
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
-
-# ✅ FIX: default actor mais fiável para URL direta de vídeo
-APIFY_ACTOR_TIKTOK = os.getenv("APIFY_ACTOR_TIKTOK", "clockworks/free-tiktok-scraper").strip()
-
+APIFY_ACTOR_TIKTOK = os.getenv("APIFY_ACTOR_TIKTOK", "clockworks/tiktok-scraper").strip()
 APIFY_ACTOR_INSTAGRAM = os.getenv("APIFY_ACTOR_INSTAGRAM", "apify/instagram-scraper").strip()
 VIEWS_REFRESH_MINUTES = int((os.getenv("VIEWS_REFRESH_MINUTES", "10").strip() or "10"))
 
@@ -85,7 +83,7 @@ HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 async def get_http_session() -> aiohttp.ClientSession:
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
-        timeout = aiohttp.ClientTimeout(total=90)
+        timeout = aiohttp.ClientTimeout(total=60)
         HTTP_SESSION = aiohttp.ClientSession(timeout=timeout)
     return HTTP_SESSION
 
@@ -244,35 +242,35 @@ def parse_human_number(v: str) -> Optional[int]:
         num *= 1_000_000
     return int(num)
 
-# ✅ Normaliza links: força https:// e remove tracking params
-TIKTOK_CANON_RE = re.compile(r"(https?://)?(www\.)?tiktok\.com/@[^/]+/video/\d+", re.IGNORECASE)
-IG_REEL_CANON_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(reel|p)/[A-Za-z0-9_-]+", re.IGNORECASE)
-
-def normalize_url(url: str) -> str:
+# ---------- URL NORMALIZATION ----------
+def ensure_https(url: str) -> str:
     u = (url or "").strip()
     if not u:
         return u
-    if u.startswith("www."):
-        u = "https://" + u
-    if not u.startswith("http://") and not u.startswith("https://"):
-        # tenta assumir https
-        u = "https://" + u
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    return "https://" + u.lstrip("/")
 
-    low = u.lower()
+def strip_query_and_fragment(url: str) -> str:
+    try:
+        p = urlparse(url)
+        p2 = p._replace(query="", fragment="")
+        return urlunparse(p2)
+    except Exception:
+        return url
 
-    if "tiktok.com" in low:
-        m = TIKTOK_CANON_RE.search(u)
-        if m:
-            return m.group(0)
-        return u.split("?")[0]
-
-    if "instagram.com" in low:
-        m = IG_REEL_CANON_RE.search(u)
-        if m:
-            return m.group(0)
-        return u.split("?")[0]
-
-    return u.split("?")[0]
+def normalize_url(url: str) -> str:
+    """
+    - garante https://
+    - remove querystring e fragment
+    - TikTok/Instagram: fica URL "limpa" para evitar duplicados e falhas no scraper
+    """
+    u = ensure_https(url)
+    u = strip_query_and_fragment(u)
+    # remove trailing slash
+    if u.endswith("/"):
+        u = u[:-1]
+    return u
 
 # =========================
 # DB INIT + MIGRATIONS
@@ -552,13 +550,18 @@ def set_maxed_notified(campaign_id: int, user_id: int):
     conn.commit()
     conn.close()
 
-def reset_user_progress(campaign_id: int, user_id: int):
-    """Apaga progresso do user na campanha: membro + submissões + pagamentos."""
+def reset_user_campaign_progress(campaign_id: int, user_id: int):
+    """
+    Apaga progresso do user na campanha:
+    - remove membership
+    - remove submissions
+    - remove campaign_users row
+    """
     conn = db_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM submissions WHERE campaign_id=? AND user_id=?", (int(campaign_id), int(user_id)))
-    cur.execute("DELETE FROM campaign_users WHERE campaign_id=? AND user_id=?", (int(campaign_id), int(user_id)))
-    cur.execute("DELETE FROM campaign_members WHERE campaign_id=? AND user_id=?", (int(campaign_id), int(user_id)))
+    cur.execute("DELETE FROM campaign_members WHERE campaign_id=? AND user_id=?", (campaign_id, user_id))
+    cur.execute("DELETE FROM submissions WHERE campaign_id=? AND user_id=?", (campaign_id, user_id))
+    cur.execute("DELETE FROM campaign_users WHERE campaign_id=? AND user_id=?", (campaign_id, user_id))
     conn.commit()
     conn.close()
 
@@ -630,8 +633,7 @@ def submit_view(campaign_id: int) -> discord.ui.View:
     v.add_item(discord.ui.Button(label="📥 Submeter link", style=discord.ButtonStyle.primary, custom_id=f"vz:submit:open:{campaign_id}"))
     v.add_item(discord.ui.Button(label="📊 Estatísticas", style=discord.ButtonStyle.secondary, custom_id=f"vz:submit:stats:{campaign_id}"))
     v.add_item(discord.ui.Button(label="🗑️ Retirar vídeo", style=discord.ButtonStyle.danger, custom_id=f"vz:submit:remove:{campaign_id}"))
-    # ✅ NOVO: sair e resetar progresso
-    v.add_item(discord.ui.Button(label="🚪 Sair (reset)", style=discord.ButtonStyle.secondary, custom_id=f"vz:camp:leave:{campaign_id}"))
+    v.add_item(discord.ui.Button(label="🚪 Sair da campanha", style=discord.ButtonStyle.secondary, custom_id=f"vz:camp:leave:{campaign_id}"))
     return v
 
 def verify_approval_view(user_id: int) -> discord.ui.View:
@@ -777,6 +779,53 @@ class IbanModal(discord.ui.Modal):
         set_iban(interaction.user.id, str(self.iban.value).strip())
         await safe_reply(interaction, "✅ IBAN guardado com sucesso.", ephemeral=True)
 
+class LeaveCampaignModal(discord.ui.Modal):
+    def __init__(self, campaign_id: int):
+        super().__init__(title="Sair da campanha (reset)")
+        self.campaign_id = int(campaign_id)
+        self.confirm = discord.ui.TextInput(
+            label="Escreve SAIR para confirmar",
+            placeholder="SAIR",
+            required=True,
+            max_length=10
+        )
+        self.add_item(self.confirm)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if str(self.confirm.value).strip().upper() != "SAIR":
+            return await safe_reply(interaction, "❌ Confirmação inválida. Tens de escrever **SAIR**.", ephemeral=True)
+
+        guild = interaction.guild or bot.get_guild(SERVER_ID)
+        if not guild:
+            return await safe_reply(interaction, "⚠️ Servidor não encontrado.", ephemeral=True)
+
+        # buscar role id
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT name, campaign_role_id FROM campaigns WHERE id=?", (self.campaign_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return await safe_reply(interaction, "❌ Campanha não encontrada.", ephemeral=True)
+
+        camp_name, role_id = row[0], row[1]
+
+        # reset DB
+        reset_user_campaign_progress(self.campaign_id, interaction.user.id)
+
+        # remover role
+        member = await fetch_member_safe(guild, interaction.user.id)
+        if member and role_id:
+            role = guild.get_role(int(role_id))
+            if role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason="Saiu da campanha (reset)")
+                except:
+                    pass
+
+        await update_leaderboard_for_campaign(self.campaign_id)
+        return await safe_reply(interaction, f"✅ Saíste da campanha **{camp_name}** e o teu progresso foi resetado (0).", ephemeral=True)
+
 class SubmitLinkModal(discord.ui.Modal):
     def __init__(self, campaign_id: int):
         super().__init__(title="Submeter link (TikTok/Instagram)")
@@ -807,15 +856,15 @@ class SubmitLinkModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, "❌ Campanha não encontrada.", ephemeral=True)
 
-        camp_id        = int(row[0])
-        name           = str(row[1])
-        platforms      = str(row[3])
-        rate           = int(row[6])
-        budget_total   = int(row[7])
-        spent_kz       = int(row[8])
-        max_user_kz    = int(row[9])
-        max_posts_total= int(row[10])
-        status         = str(row[11])
+        camp_id         = int(row[0])
+        name            = str(row[1])
+        platforms       = str(row[3])
+        rate            = int(row[6])
+        budget_total    = int(row[7])
+        spent_kz        = int(row[8])
+        max_user_kz     = int(row[9])
+        max_posts_total = int(row[10])
+        status          = str(row[11])
 
         if status != "active":
             conn.close()
@@ -834,11 +883,11 @@ class SubmitLinkModal(discord.ui.Modal):
             return await safe_reply(interaction, f"⛔ Já atingiste o teu limite (**{max_user_kz:,} Kz**). Não podes submeter mais vídeos.", ephemeral=True)
 
         raw_url = str(self.url.value).strip()
-        url = normalize_url(raw_url)
-
-        if not url.startswith("http://") and not url.startswith("https://"):
+        if not raw_url:
             conn.close()
-            return await safe_reply(interaction, "❌ Link inválido. Envia um link completo com **https://**", ephemeral=True)
+            return await safe_reply(interaction, "❌ Link inválido.", ephemeral=True)
+
+        url = normalize_url(raw_url)
 
         platform = detect_platform(url)
         allowed = parse_campaign_platforms(platforms)
@@ -846,6 +895,7 @@ class SubmitLinkModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, f"❌ Esta campanha só aceita: **{', '.join([p.upper() for p in allowed])}**.", ephemeral=True)
 
+        # limite total de posts da campanha
         cur.execute("""
         SELECT COUNT(*)
         FROM submissions
@@ -856,6 +906,7 @@ class SubmitLinkModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, f"⚠️ Esta campanha já atingiu o máximo de posts (**{max_posts_total}**).", ephemeral=True)
 
+        # impede submeter o mesmo vídeo (agora com URL normalizado)
         now = _now()
         try:
             cur.execute("""
@@ -866,7 +917,7 @@ class SubmitLinkModal(discord.ui.Modal):
             conn.commit()
         except sqlite3.IntegrityError:
             conn.close()
-            return await safe_reply(interaction, "⚠️ Este link (mesmo vídeo) já foi submetido nesta campanha.", ephemeral=True)
+            return await safe_reply(interaction, "⚠️ Este link já foi submetido nesta campanha.", ephemeral=True)
 
         conn.close()
 
@@ -883,7 +934,7 @@ class SubmitLinkModal(discord.ui.Modal):
                 view=submission_approval_view(submission_id)
             )
 
-        await safe_reply(interaction, "✅ Link submetido! Aguarda aprovação do staff.", ephemeral=True)
+        await safe_reply(interaction, "✅ Link submetido (URL normalizado). Aguarda aprovação do staff.", ephemeral=True)
 
 class RemoveLinkModal(discord.ui.Modal):
     def __init__(self, campaign_id: int):
@@ -935,7 +986,7 @@ class RemoveLinkModal(discord.ui.Modal):
         await safe_reply(interaction, "✅ Vídeo retirado. Ele deixa de ser contado/atualizado.", ephemeral=True)
 
 # =========================
-# CAMPAIGN WORKSPACE PRIVADO
+# CAMPAIGN WORKSPACE PRIVADO (SÓ NO ADERIR)
 # =========================
 async def ensure_campaign_role(guild: discord.Guild, campaign_id: int, slug: str, existing_role_id: Optional[int]) -> discord.Role:
     role = None
@@ -1109,12 +1160,30 @@ async def refreshnow(ctx):
 @commands.has_permissions(administrator=True)
 @bot.command()
 async def debugviews(ctx, url: str):
-    """Testa 1 URL e mostra as views que o Apify devolveu."""
     if not APIFY_TOKEN:
         return await ctx.send("⚠️ APIFY_TOKEN não está definido no Render.")
-    u = normalize_url(url)
-    await ctx.send(f"⏳ A testar no Apify…\nURL normalizado: {u}\nActor: `{APIFY_ACTOR_TIKTOK}`")
-    v = await apify_get_views_for_url(u)
+
+    url_n = normalize_url(url)
+    plat = detect_platform(url_n)
+
+    await ctx.send(
+        "⏳ A testar no Apify…\n"
+        f"URL normalizado:\n{url_n}\n"
+        f"Plataforma: {plat.upper()}"
+    )
+
+    v, info = await apify_get_views_for_url_debug(url_n)
+
+    if info:
+        keys = info.get("keys") or []
+        sample = info.get("sample") or ""
+        actor = info.get("actor") or ""
+        await ctx.send(
+            f"Actor: `{actor}`\n"
+            f"Top-keys: `{', '.join(keys[:25])}`\n"
+            f"Extract sample: `{sample[:180]}`"
+        )
+
     await ctx.send(f"📊 Views devolvidas: **{v}**")
 
 # =========================
@@ -1163,7 +1232,7 @@ async def reattach_submit_panels():
             pass
 
 # =========================
-# LEADERBOARD
+# LEADERBOARD (Kz pagos + views atuais)
 # =========================
 async def update_leaderboard_for_campaign(campaign_id: int):
     guild = bot.get_guild(SERVER_ID)
@@ -1229,9 +1298,9 @@ async def update_leaderboard_for_campaign(campaign_id: int):
         pass
 
 # =========================
-# APIFY
+# APIFY: obter views
 # =========================
-async def apify_run(actor: str, payload: dict) -> Optional[dict]:
+async def apify_run(actor: str, payload: dict, limit: int = 5) -> Optional[List[dict]]:
     if not APIFY_TOKEN:
         return None
 
@@ -1242,7 +1311,7 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
         async with session.post(run_url, json=payload) as r:
             if r.status >= 400:
                 txt = await r.text()
-                print(f"⚠️ APIFY POST status={r.status} actor={actor} body={txt[:800]}")
+                print(f"⚠️ APIFY POST status={r.status} actor={actor} body={txt[:500]}")
                 return None
             data = await r.json()
             run = data.get("data", {}) or {}
@@ -1257,7 +1326,7 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
             async with session.get(f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}") as rr:
                 if rr.status >= 400:
                     txt = await rr.text()
-                    print(f"⚠️ APIFY RUN status={rr.status} body={txt[:800]}")
+                    print(f"⚠️ APIFY RUN status={rr.status} body={txt[:500]}")
                     return None
                 rd = await rr.json()
                 status = (rd.get("data", {}) or {}).get("status")
@@ -1270,11 +1339,11 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
             return None
 
         async with session.get(
-            f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&clean=true&limit=1"
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&clean=true&limit={int(limit)}"
         ) as ri:
             if ri.status >= 400:
                 txt = await ri.text()
-                print(f"⚠️ APIFY DATASET status={ri.status} body={txt[:800]}")
+                print(f"⚠️ APIFY DATASET status={ri.status} body={txt[:500]}")
                 return None
             items = await ri.json()
 
@@ -1282,79 +1351,105 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
             print("⚠️ APIFY: items vazios/invalidos:", items)
             return None
 
-        return items[0]
+        return items
     except Exception as e:
         print("⚠️ APIFY erro:", e)
         traceback.print_exc()
         return None
 
-def extract_views_from_item(item: dict) -> Optional[int]:
-    if not item or not isinstance(item, dict):
-        return None
+def _walk_find_views(obj: Any) -> Optional[int]:
+    """
+    Procura recursivamente por chaves comuns de views e devolve o maior int encontrado.
+    Isso resolve o "None" quando o actor devolve a métrica noutro caminho.
+    """
+    keys_priority = {"playcount", "viewcount", "views", "play_count", "video_view_count", "videoviewcount"}
+    best = None
 
-    candidates = [
-        "playCount", "plays", "views", "viewCount", "videoViewCount", "video_view_count",
-        "videoPlayCount", "video_play_count"
-    ]
-
-    for k in candidates:
-        v = item.get(k)
-        if isinstance(v, int):
-            return v
-        if isinstance(v, (float,)):
-            return int(v)
-        if isinstance(v, str):
+    def consider(v):
+        nonlocal best
+        if isinstance(v, int) and v >= 0:
+            best = v if best is None else max(best, v)
+        elif isinstance(v, str):
             hv = parse_human_number(v)
             if hv is not None:
-                return hv
+                best = hv if best is None else max(best, hv)
 
-    stats = item.get("stats") or {}
-    if isinstance(stats, dict):
-        for k in ["playCount", "viewCount", "views", "videoViewCount"]:
-            v = stats.get(k)
-            if isinstance(v, int):
-                return v
-            if isinstance(v, (float,)):
-                return int(v)
-            if isinstance(v, str):
-                hv = parse_human_number(v)
-                if hv is not None:
-                    return hv
+    def rec(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                lk = str(k).lower()
+                if lk in keys_priority:
+                    consider(v)
+                rec(v)
+        elif isinstance(x, list):
+            for it in x:
+                rec(it)
 
-    return None
+    rec(obj)
+    return best
 
 async def apify_get_views_for_url(url: str) -> Optional[int]:
-    url = normalize_url(url)
-    platform = detect_platform(url)
+    url_n = normalize_url(url)
+    platform = detect_platform(url_n)
 
     if platform == "tiktok":
-        # ✅ FIX: free-tiktok-scraper usa postURLs
-        if "free-tiktok-scraper" in APIFY_ACTOR_TIKTOK:
-            payload = {
-                "postURLs": [url],
-                "resultsPerPage": 1,
-                "maxProfilesPerQuery": 1,
-            }
-        else:
-            # fallback se trocares actor para outro
-            payload = {"startUrls": [{"url": url}], "maxItems": 1}
-
-        item = await apify_run(APIFY_ACTOR_TIKTOK, payload)
-        return extract_views_from_item(item) if item else None
+        payload = {
+            "startUrls": [{"url": url_n}],
+            "maxItems": 1
+        }
+        items = await apify_run(APIFY_ACTOR_TIKTOK, payload, limit=5)
+        if not items:
+            return None
+        # tenta extrair o maior valor possível
+        best = _walk_find_views(items)
+        return best
 
     if platform == "instagram":
-        payload = {"directUrls": [url], "resultsType": "posts", "resultsLimit": 1}
-        item = await apify_run(APIFY_ACTOR_INSTAGRAM, payload)
-        return extract_views_from_item(item) if item else None
+        payload = {"directUrls": [url_n], "resultsType": "posts", "resultsLimit": 1}
+        items = await apify_run(APIFY_ACTOR_INSTAGRAM, payload, limit=3)
+        if not items:
+            return None
+        best = _walk_find_views(items)
+        return best
 
     return None
 
+async def apify_get_views_for_url_debug(url: str) -> Tuple[Optional[int], Dict[str, Any]]:
+    url_n = normalize_url(url)
+    platform = detect_platform(url_n)
+
+    actor = None
+    payload = None
+
+    if platform == "tiktok":
+        actor = APIFY_ACTOR_TIKTOK
+        payload = {"startUrls": [{"url": url_n}], "maxItems": 1}
+    elif platform == "instagram":
+        actor = APIFY_ACTOR_INSTAGRAM
+        payload = {"directUrls": [url_n], "resultsType": "posts", "resultsLimit": 1}
+    else:
+        return None, {"actor": "", "keys": [], "sample": "unknown platform"}
+
+    items = await apify_run(actor, payload, limit=5)
+    if not items:
+        return None, {"actor": actor, "keys": [], "sample": "no items"}
+
+    # debug keys do primeiro item
+    first = items[0] if isinstance(items, list) and items else {}
+    keys = list(first.keys()) if isinstance(first, dict) else []
+    best = _walk_find_views(items)
+
+    return best, {
+        "actor": actor,
+        "keys": keys,
+        "sample": str(first)[:400]
+    }
+
 # =========================
-# VIEWS REFRESH
+# VIEWS REFRESH (shared)
 # =========================
 async def refresh_views_once() -> None:
     if not APIFY_TOKEN:
-        print("⚠️ refresh_views_once: APIFY_TOKEN não definido.")
         return
 
     conn = db_conn()
@@ -1374,8 +1469,6 @@ async def refresh_views_once() -> None:
     for (sub_id, camp_id, user_id, url, paid_views,
          rate, budget_total, spent_kz, max_user_kz, camp_status) in rows:
 
-        url = normalize_url(url)
-
         views = await apify_get_views_for_url(url)
         if views is None:
             print(f"⚠️ Views None (Apify) url={url}")
@@ -1384,10 +1477,10 @@ async def refresh_views_once() -> None:
         conn2 = db_conn()
         cur2 = conn2.cursor()
 
-        # atualiza views_current SEMPRE
+        # update views_current
         cur2.execute("UPDATE submissions SET views_current=? WHERE id=?", (int(views), int(sub_id)))
 
-        # pagamento por blocos de 1000
+        # paga por blocos de 1000 (independente do número total de views)
         payable_total = (int(views) // 1000) * 1000
         to_pay_views = payable_total - int(paid_views)
 
@@ -1400,8 +1493,10 @@ async def refresh_views_once() -> None:
         to_pay_kz = (to_pay_views // 1000) * int(rate)
 
         # user already paid
-        cur2.execute("SELECT COALESCE(paid_kz,0), COALESCE(maxed_notified,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
-                     (int(camp_id), int(user_id)))
+        cur2.execute(
+            "SELECT COALESCE(paid_kz,0), COALESCE(maxed_notified,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
+            (int(camp_id), int(user_id))
+        )
         rowu = cur2.fetchone()
         already_paid_kz = int(rowu[0]) if rowu else 0
         maxed_notified = int(rowu[1]) if rowu else 0
@@ -1680,40 +1775,13 @@ async def on_interaction(interaction: discord.Interaction):
             await update_leaderboard_for_campaign(int(camp_id))
             return await safe_reply(interaction, f"✅ Aderiste! Agora tens acesso à categoria: <#{cat_id}>", ephemeral=True)
 
-        # ✅ LEAVE/RESET
+        # LEAVE CAMPAIGN (reset)
         if cid.startswith("vz:camp:leave:"):
-            await safe_defer(interaction, ephemeral=True)
             parts = cid.split(":")
             if len(parts) != 4:
                 return
             camp_id = int(parts[3])
-
-            guild = interaction.guild or bot.get_guild(SERVER_ID)
-            member = await fetch_member_safe(guild, interaction.user.id) if guild else None
-            if not guild or not member:
-                return await safe_reply(interaction, "⚠️ Servidor não encontrado.", ephemeral=True)
-
-            # buscar role da campanha
-            conn = db_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT campaign_role_id FROM campaigns WHERE id=?", (camp_id,))
-            rr = cur.fetchone()
-            conn.close()
-            role_id = int(rr[0]) if rr and rr[0] else None
-            role = guild.get_role(role_id) if role_id else None
-
-            # apaga progresso
-            reset_user_progress(camp_id, interaction.user.id)
-
-            # remove role
-            if role and role in member.roles:
-                try:
-                    await member.remove_roles(role, reason="Saiu da campanha (reset)")
-                except:
-                    pass
-
-            await update_leaderboard_for_campaign(int(camp_id))
-            return await safe_reply(interaction, "✅ Saíste da campanha e o teu progresso foi **resetado**. Podes aderir e testar do 0.", ephemeral=True)
+            return await interaction.response.send_modal(LeaveCampaignModal(camp_id))
 
         # SUBMIT buttons
         if cid.startswith("vz:submit:"):
@@ -1809,7 +1877,7 @@ async def on_interaction(interaction: discord.Interaction):
                 cur.execute("UPDATE submissions SET status='approved', approved_at=? WHERE id=?", (_now(), sub_id))
                 conn.commit()
 
-                # ✅ tenta puxar views logo na aprovação
+                # tenta buscar views já na aprovação
                 initial_views = None
                 if APIFY_TOKEN:
                     try:
