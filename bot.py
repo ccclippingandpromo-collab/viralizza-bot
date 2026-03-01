@@ -8,7 +8,7 @@ import secrets
 import string
 import signal
 import traceback
-from typing import Optional
+from typing import Optional, Tuple
 
 import aiohttp
 import discord
@@ -190,9 +190,21 @@ def detect_platform(url: str) -> str:
         return "instagram"
     return "unknown"
 
+def slugify(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = re.sub(r"[^a-z0-9]+", "-", t)
+    t = re.sub(r"-{2,}", "-", t).strip("-")
+    return t[:64] if t else "campanha"
+
 # =========================
-# DB INIT
+# DB INIT + MIGRATIONS
 # =========================
+def _column_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    return col in cols
+
 def init_db():
     conn = db_conn()
     cur = conn.cursor()
@@ -245,6 +257,14 @@ def init_db():
         created_at INTEGER NOT NULL
     )
     """)
+
+    # MIGRATION: guardar role por campanha (para acesso privado)
+    if not _column_exists(conn, "campaigns", "campaign_role_id"):
+        try:
+            cur.execute("ALTER TABLE campaigns ADD COLUMN campaign_role_id INTEGER")
+            print("✅ MIGRATION: campaigns.campaign_role_id adicionado")
+        except Exception as e:
+            print("⚠️ MIGRATION falhou (talvez já exista):", e)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS submissions (
@@ -360,6 +380,77 @@ def list_pending_verifications():
     conn.close()
     return rows
 
+# ===== CAMPAIGN HELPERS =====
+def get_campaign_by_slug(conn, slug: str):
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT id, name, slug, platforms, content_types, audio_url,
+           rate_kz_per_1k, budget_total_kz, spent_kz,
+           max_payout_user_kz, max_posts_total, status,
+           campaigns_channel_id, post_message_id,
+           category_id, details_channel_id, requirements_channel_id,
+           submit_channel_id, submit_panel_message_id,
+           leaderboard_channel_id, leaderboard_message_id,
+           campaign_role_id
+    FROM campaigns WHERE slug=?
+    """, (slug,))
+    return cur.fetchone()
+
+def get_campaign_by_id(conn, campaign_id: int):
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT id, name, slug, platforms, content_types, audio_url,
+           rate_kz_per_1k, budget_total_kz, spent_kz,
+           max_payout_user_kz, max_posts_total, status,
+           campaigns_channel_id, post_message_id,
+           category_id, details_channel_id, requirements_channel_id,
+           submit_channel_id, submit_panel_message_id,
+           leaderboard_channel_id, leaderboard_message_id,
+           campaign_role_id
+    FROM campaigns WHERE id=?
+    """, (campaign_id,))
+    return cur.fetchone()
+
+def set_campaign_post_message_id(slug: str, msg_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE campaigns SET post_message_id=? WHERE slug=?", (int(msg_id), slug))
+    conn.commit()
+    conn.close()
+
+def set_campaign_role_id(campaign_id: int, role_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE campaigns SET campaign_role_id=? WHERE id=?", (int(role_id), int(campaign_id)))
+    conn.commit()
+    conn.close()
+
+def set_campaign_workspace_ids(
+    campaign_id: int,
+    category_id: int,
+    details_id: int,
+    req_id: int,
+    submit_id: int,
+    submit_panel_id: int,
+    lb_id: int,
+    lb_msg_id: int
+):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE campaigns SET
+            category_id=?,
+            details_channel_id=?,
+            requirements_channel_id=?,
+            submit_channel_id=?,
+            submit_panel_message_id=?,
+            leaderboard_channel_id=?,
+            leaderboard_message_id=?
+        WHERE id=?
+    """, (category_id, details_id, req_id, submit_id, submit_panel_id, lb_id, lb_msg_id, campaign_id))
+    conn.commit()
+    conn.close()
+
 # =========================
 # CAMPANHA TESTE
 # =========================
@@ -402,34 +493,6 @@ def requirements_text(c):
         "🎵 **Áudio (se aplicável):**\n"
         f"{c.get('audio_url','')}\n"
     )
-
-def get_campaign_by_slug(conn, slug: str):
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT id, name, slug, platforms, content_types, audio_url,
-           rate_kz_per_1k, budget_total_kz, spent_kz,
-           max_payout_user_kz, max_posts_total, status,
-           campaigns_channel_id, post_message_id,
-           category_id, details_channel_id, requirements_channel_id,
-           submit_channel_id, submit_panel_message_id,
-           leaderboard_channel_id, leaderboard_message_id
-    FROM campaigns WHERE slug=?
-    """, (slug,))
-    return cur.fetchone()
-
-def get_campaign_by_id(conn, campaign_id: int):
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT id, name, slug, platforms, content_types, audio_url,
-           rate_kz_per_1k, budget_total_kz, spent_kz,
-           max_payout_user_kz, max_posts_total, status,
-           campaigns_channel_id, post_message_id,
-           category_id, details_channel_id, requirements_channel_id,
-           submit_channel_id, submit_panel_message_id,
-           leaderboard_channel_id, leaderboard_message_id
-    FROM campaigns WHERE id=?
-    """, (campaign_id,))
-    return cur.fetchone()
 
 # =========================
 # UI VIEWS (persistent)
@@ -668,6 +731,106 @@ class SubmitLinkModal(discord.ui.Modal):
         await safe_reply(interaction, "✅ Link submetido! Aguarda aprovação do staff.", ephemeral=True)
 
 # =========================
+# CAMPAIGN WORKSPACE (SÓ NO ADERIR)
+# =========================
+async def ensure_campaign_role(guild: discord.Guild, campaign_id: int, slug: str, existing_role_id: Optional[int]) -> discord.Role:
+    role = None
+    if existing_role_id:
+        role = guild.get_role(int(existing_role_id))
+    if role:
+        return role
+
+    # criar role novo
+    role_name = f"VZ • {slug}"
+    role = discord.utils.get(guild.roles, name=role_name)
+    if role is None:
+        role = await guild.create_role(name=role_name, reason="Viralizzaa campaign access role")
+
+    set_campaign_role_id(campaign_id, role.id)
+    return role
+
+async def ensure_campaign_workspace_private(
+    guild: discord.Guild,
+    camp_id: int,
+    name: str,
+    slug: str,
+    platforms: str,
+    content_types: str,
+    audio_url: str,
+    rate: int,
+    budget_total: int,
+    max_user_kz: int,
+    max_posts_total: int,
+    category_id: Optional[int],
+    campaign_role: discord.Role
+) -> int:
+    # se já existe categoria e ainda existe no discord, não recria
+    existing = guild.get_channel(int(category_id)) if category_id else None
+    if existing:
+        return int(existing.id)
+
+    bot_member = await get_bot_member_safe(guild)
+    admin_member = guild.get_member(ADMIN_USER_ID) or await fetch_member_safe(guild, ADMIN_USER_ID)
+
+    # PRIVADO: só role da campanha, bot e admin
+    overwrites_cat = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        campaign_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
+    }
+    if bot_member:
+        overwrites_cat[bot_member] = discord.PermissionOverwrite(
+            view_channel=True, read_message_history=True, send_messages=True,
+            manage_channels=True, manage_messages=True
+        )
+    if admin_member:
+        overwrites_cat[admin_member] = discord.PermissionOverwrite(
+            view_channel=True, read_message_history=True, send_messages=True, manage_messages=True
+        )
+
+    category = await guild.create_category(f"🎯 {name}", overwrites=overwrites_cat)
+
+    # canais: detalhes/requisitos/leaderboard só leitura; submit pode escrever
+    overw_ro = overwrites_cat.copy()
+    overw_ro[campaign_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=False)
+
+    overw_submit = overwrites_cat.copy()
+    overw_submit[campaign_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True)
+
+    details_ch = await guild.create_text_channel("1-detalhes-da-campanha", category=category, overwrites=overw_ro)
+    req_ch = await guild.create_text_channel("2-requisitos", category=category, overwrites=overw_ro)
+    submit_ch = await guild.create_text_channel("3-submeter-links", category=category, overwrites=overw_submit)
+    lb_ch = await guild.create_text_channel("4-leaderboard", category=category, overwrites=overw_ro)
+
+    cobj = {
+        "name": name,
+        "platforms": platforms,
+        "content_types": content_types,
+        "audio_url": audio_url,
+        "rate_kz_per_1k": rate,
+        "budget_total_kz": budget_total,
+        "max_payout_user_kz": max_user_kz,
+        "max_posts_total": max_posts_total,
+    }
+    await details_ch.send(details_channel_text(cobj))
+    await req_ch.send(requirements_text(cobj))
+
+    submit_panel = await submit_ch.send("📤 **Submete os teus links aqui**\n\nUsa os botões 👇", view=submit_view(camp_id))
+    lb_msg = await lb_ch.send("🏆 **LEADERBOARD**\n(aguarda atualizações automáticas)")
+
+    set_campaign_workspace_ids(
+        campaign_id=camp_id,
+        category_id=category.id,
+        details_id=details_ch.id,
+        req_id=req_ch.id,
+        submit_id=submit_ch.id,
+        submit_panel_id=submit_panel.id,
+        lb_id=lb_ch.id,
+        lb_msg_id=lb_msg.id
+    )
+
+    return int(category.id)
+
+# =========================
 # COMMANDS
 # =========================
 @bot.command()
@@ -686,78 +849,14 @@ async def ibanpanel(ctx):
 async def suporte(ctx):
     if ctx.guild and ctx.guild.id != SERVER_ID:
         return
-    # força a usar no canal de suporte
     if ctx.channel.id != SUPORTE_CHANNEL_ID:
         return await ctx.send(f"Usa o suporte aqui: <#{SUPORTE_CHANNEL_ID}>")
     await ctx.send("🆘 **SUPORTE**\nEscolhe uma opção:", view=SupportView())
 
-# =========================
-# CAMPANHA: agora cria categoria + canais logo no !campanha
-# =========================
-async def ensure_campaign_workspace(guild: discord.Guild, camp_id: int, name: str, platforms: str, content_types: str,
-                                   audio_url: str, rate: int, budget_total: int, max_user_kz: int, max_posts_total: int,
-                                   category_id: Optional[int]):
-    # se existe e ainda existe no discord, não recria
-    existing = guild.get_channel(int(category_id)) if category_id else None
-    if existing:
-        return
-
-    role_verified = guild.get_role(VERIFICADO_ROLE_ID)
-    bot_member = await get_bot_member_safe(guild)
-
-    overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-    if role_verified:
-        overwrites[role_verified] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=False)
-    if bot_member:
-        overwrites[bot_member] = discord.PermissionOverwrite(
-            view_channel=True, read_message_history=True, send_messages=True, manage_channels=True, manage_messages=True
-        )
-
-    admin_member = guild.get_member(ADMIN_USER_ID) or await fetch_member_safe(guild, ADMIN_USER_ID)
-    if admin_member:
-        overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True, manage_messages=True)
-
-    category = await guild.create_category(f"🎯 {name}", overwrites=overwrites)
-    details_ch = await guild.create_text_channel("1-detalhes-da-campanha", category=category, overwrites=overwrites)
-    req_ch = await guild.create_text_channel("2-requisitos", category=category, overwrites=overwrites)
-    submit_ch = await guild.create_text_channel("3-submeter-links", category=category, overwrites=overwrites)
-    lb_ch = await guild.create_text_channel("4-leaderboard", category=category, overwrites=overwrites)
-
-    cobj = {
-        "name": name,
-        "platforms": platforms,
-        "content_types": content_types,
-        "audio_url": audio_url,
-        "rate_kz_per_1k": rate,
-        "budget_total_kz": budget_total,
-        "max_payout_user_kz": max_user_kz,
-        "max_posts_total": max_posts_total,
-    }
-    await details_ch.send(details_channel_text(cobj))
-    await req_ch.send(requirements_text(cobj))
-
-    submit_panel = await submit_ch.send("📤 **Submete os teus links aqui**\n\nUsa os botões 👇", view=submit_view(camp_id))
-    lb_msg = await lb_ch.send("🏆 **LEADERBOARD**\n(aguarda atualizações automáticas)")
-
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE campaigns SET
-            category_id=?,
-            details_channel_id=?,
-            requirements_channel_id=?,
-            submit_channel_id=?,
-            submit_panel_message_id=?,
-            leaderboard_channel_id=?,
-            leaderboard_message_id=?
-        WHERE id=?
-    """, (category.id, details_ch.id, req_ch.id, submit_ch.id, submit_panel.id, lb_ch.id, lb_msg.id, camp_id))
-    conn.commit()
-    conn.close()
-
 @commands.has_permissions(administrator=True)
 @bot.command()
 async def campanha(ctx):
+    """✅ Agora: só publica o post/painel em #campanhas. NÃO cria categoria."""
     if ctx.guild and ctx.guild.id != SERVER_ID:
         return
 
@@ -784,20 +883,9 @@ async def campanha(ctx):
         conn.close()
         return await ctx.send("❌ Erro ao criar campanha no DB.")
 
-    camp_id = row[0]
-    name = row[1]
-    platforms = row[3]
-    content_types = row[4]
-    audio_url = row[5]
-    rate = row[6]
-    budget_total = row[7]
-    max_user_kz = row[9]
-    max_posts_total = row[10]
     post_msg_id = row[13]
-    category_id = row[14]
     conn.close()
 
-    # Publica o post da campanha no canal certo (ou fallback no canal onde o admin escreveu)
     guild = ctx.guild
     ch = guild.get_channel(CAMPANHAS_CHANNEL_ID) if guild else None
     target = ch or ctx.channel
@@ -811,38 +899,10 @@ async def campanha(ctx):
             needs_new_post = True
 
     if needs_new_post:
-        try:
-            msg = await target.send(campaign_post_text(c), view=JoinCampaignView())
-            # se publicou fora do canal, pelo menos guarda
-            conn2 = db_conn()
-            cur2 = conn2.cursor()
-            cur2.execute("UPDATE campaigns SET post_message_id=? WHERE slug=?", (msg.id, c["slug"]))
-            conn2.commit()
-            conn2.close()
-        except Exception as e:
-            return await ctx.send(f"❌ Falhei a publicar a campanha. Erro: `{e}`")
+        msg = await target.send(campaign_post_text(c), view=JoinCampaignView())
+        set_campaign_post_message_id(c["slug"], msg.id)
 
-    # ✅ CRIA LOGO a categoria + canais aqui
-    try:
-        await ensure_campaign_workspace(
-            guild=guild,
-            camp_id=camp_id,
-            name=name,
-            platforms=platforms,
-            content_types=content_types,
-            audio_url=audio_url,
-            rate=rate,
-            budget_total=budget_total,
-            max_user_kz=max_user_kz,
-            max_posts_total=max_posts_total,
-            category_id=category_id
-        )
-    except Exception as e:
-        print("⚠️ Erro a criar workspace campanha:", e)
-        traceback.print_exc()
-        return await ctx.send("⚠️ Campanha publicada, mas falhei a criar a categoria/canais (vê logs e permissões do bot).")
-
-    await ctx.send(f"✅ Campanha criada e publicada. Categoria criada para: **{name}**")
+    await ctx.send("✅ Campanha teste publicada em #campanhas. (A categoria só aparece quando alguém aderir)")
 
 # =========================
 # REATTACH PANELS
@@ -1162,7 +1222,6 @@ async def on_interaction(interaction: discord.Interaction):
 
             select.callback = _cb
             view.add_item(select)
-
             return await safe_reply(interaction, "Escolhe a rede social:", ephemeral=True, view=view)
 
         if cid == "vz:view_account":
@@ -1183,7 +1242,6 @@ async def on_interaction(interaction: discord.Interaction):
         # -------- SUPORTE --------
         if cid == "vz:support:campaign":
             return await interaction.response.send_modal(SupportCampaignModal())
-
         if cid == "vz:support:question":
             return await interaction.response.send_modal(SupportQuestionModal())
 
@@ -1265,7 +1323,7 @@ async def on_interaction(interaction: discord.Interaction):
             iban, updated_at = row
             return await safe_reply(interaction, f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}", ephemeral=True)
 
-        # -------- JOIN CAMPAIGN (agora só direciona, porque a categoria já é criada no !campanha) --------
+        # -------- JOIN CAMPAIGN (AQUI CRIA ROLE + CATEGORIA PRIVADA) --------
         if cid == "vz:camp:join":
             await safe_defer(interaction, ephemeral=True)
             guild = interaction.guild or bot.get_guild(SERVER_ID)
@@ -1276,25 +1334,57 @@ async def on_interaction(interaction: discord.Interaction):
                 return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para aderir.", ephemeral=True)
 
             post_id = interaction.message.id
+
             conn = db_conn()
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, name, category_id, status FROM campaigns WHERE post_message_id=?",
+                "SELECT id, name, slug, platforms, content_types, audio_url, rate_kz_per_1k, budget_total_kz, "
+                "max_payout_user_kz, max_posts_total, status, category_id, campaign_role_id "
+                "FROM campaigns WHERE post_message_id=?",
                 (post_id,)
             )
             row = cur.fetchone()
             conn.close()
+
             if not row:
                 return await safe_reply(interaction, "❌ Campanha não encontrada no DB. Admin: `!campanha`.", ephemeral=True)
 
-            camp_id, name, category_id, status = row
+            camp_id, name, slug, platforms, content_types, audio_url, rate, budget_total, max_user_kz, max_posts_total, status, category_id, role_id = row
             if status != "active":
                 return await safe_reply(interaction, "⚠️ Esta campanha já terminou.", ephemeral=True)
 
-            if not category_id or not guild.get_channel(int(category_id)):
-                return await safe_reply(interaction, "⚠️ Categoria da campanha não existe. Admin: corre `!campanha` de novo.", ephemeral=True)
+            # 1) garantir role da campanha
+            campaign_role = await ensure_campaign_role(guild, int(camp_id), str(slug), int(role_id) if role_id else None)
 
-            return await safe_reply(interaction, f"✅ Aderiste! Vai à categoria: <#{int(category_id)}> — **{name}**", ephemeral=True)
+            # 2) dar role ao utilizador (aderir)
+            if campaign_role not in member.roles:
+                try:
+                    await member.add_roles(campaign_role, reason="Aderiu à campanha")
+                except discord.Forbidden:
+                    return await safe_reply(interaction, "⛔ Bot sem permissões para atribuir o role da campanha.", ephemeral=True)
+
+            # 3) criar workspace privado (se ainda não existe)
+            try:
+                cat_id = await ensure_campaign_workspace_private(
+                    guild=guild,
+                    camp_id=int(camp_id),
+                    name=str(name),
+                    slug=str(slug),
+                    platforms=str(platforms),
+                    content_types=str(content_types),
+                    audio_url=str(audio_url or ""),
+                    rate=int(rate),
+                    budget_total=int(budget_total),
+                    max_user_kz=int(max_user_kz),
+                    max_posts_total=int(max_posts_total),
+                    category_id=int(category_id) if category_id else None,
+                    campaign_role=campaign_role
+                )
+            except Exception:
+                traceback.print_exc()
+                return await safe_reply(interaction, "⚠️ Aderiste, mas falhei a criar a categoria/canais (vê logs/permissões).", ephemeral=True)
+
+            return await safe_reply(interaction, f"✅ Aderiste! Agora tens acesso à categoria: <#{cat_id}>", ephemeral=True)
 
         # -------- SUBMIT --------
         if cid.startswith("vz:submit:"):
@@ -1384,7 +1474,6 @@ async def on_interaction(interaction: discord.Interaction):
     except Exception as e:
         print("⚠️ on_interaction erro:", e)
         traceback.print_exc()
-        # tenta responder para não aparecer "interaction failed"
         try:
             if interaction and not interaction.response.is_done():
                 await interaction.response.send_message("⚠️ Erro interno. Vê os logs no Render.", ephemeral=True)
