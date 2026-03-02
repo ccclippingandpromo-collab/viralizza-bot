@@ -2025,4 +2025,4 @@ signal.signal(signal.SIGINT, _handle_sigterm)
 # RUN
 # =========================
 keep_alive()
-bot.run(BOT_TOKEN) 
+bot.run(BOT_TOKEN)
