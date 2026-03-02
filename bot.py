@@ -8,7 +8,7 @@ import secrets
 import string
 import signal
 import traceback
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import aiohttp
 import discord
@@ -54,19 +54,24 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/database.sqlite3").strip()
 # APIFY
 # =========================
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
-APIFY_ACTOR_TIKTOK = os.getenv("APIFY_ACTOR_TIKTOK", "clockworks/tiktok-scraper").strip()
-APIFY_ACTOR_INSTAGRAM = os.getenv("APIFY_ACTOR_INSTAGRAM", "apify/instagram-scraper").strip()
+
+APIFY_ACTOR_TIKTOK = os.getenv("APIFY_ACTOR_TIKTOK", "clockworks~tiktok-scraper").strip()
+APIFY_ACTOR_INSTAGRAM = os.getenv("APIFY_ACTOR_INSTAGRAM", "apify~instagram-scraper").strip()
+
 VIEWS_REFRESH_MINUTES = int((os.getenv("VIEWS_REFRESH_MINUTES", "10").strip() or "10"))
 
-# ✅ PROXY OPCIONAL (só se quiseres)
-# Se APIFY_USE_PROXY=1 => o bot envia proxyConfiguration no payload
-APIFY_USE_PROXY = (os.getenv("APIFY_USE_PROXY", "0").strip() in ("1", "true", "TRUE", "yes", "YES"))
-APIFY_PROXY_COUNTRY = os.getenv("APIFY_PROXY_COUNTRY", "PT").strip()  # PT/US/FR etc
-APIFY_PROXY_GROUPS = [g.strip() for g in (os.getenv("APIFY_PROXY_GROUPS", "").strip()).split(",") if g.strip()]
-# Ex: APIFY_PROXY_GROUPS=residential (depende do teu plano/conta; se vazio, não envia)
+# Proxy config (optional)
+APIFY_USE_PROXY = (os.getenv("APIFY_USE_PROXY", "false").strip().lower() in ("1", "true", "yes", "y", "on"))
+APIFY_PROXY_COUNTRY = os.getenv("APIFY_PROXY_COUNTRY", "").strip().upper()  # ex: PT
+APIFY_PROXY_GROUPS_RAW = os.getenv("APIFY_PROXY_GROUPS", "").strip()        # ex: RESIDENTIAL,SHADER
+APIFY_PROXY_GROUPS = [g.strip().upper() for g in APIFY_PROXY_GROUPS_RAW.split(",") if g.strip()]
 
 # CAMPANHA: trava novas submissões quando gastar >= 95%
 CAMPAIGN_SUBMISSION_LOCK_PCT = float((os.getenv("CAMPAIGN_SUBMISSION_LOCK_PCT", "0.95").strip() or "0.95"))
+
+# LIMITES / MENSAGENS
+MAX_APPROVED_PER_USER = int(os.getenv("MAX_APPROVED_PER_USER", "10").strip() or "10")
+PAYMENTS_NOTICE = "✅ Pagamentos serão enviados em breve (**3–7 dias úteis**)."
 
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
 print("DB_PATH:", DB_PATH)
@@ -78,6 +83,7 @@ print("APIFY_USE_PROXY:", APIFY_USE_PROXY)
 print("APIFY_PROXY_COUNTRY:", APIFY_PROXY_COUNTRY)
 print("APIFY_PROXY_GROUPS:", APIFY_PROXY_GROUPS)
 print("CAMPAIGN_SUBMISSION_LOCK_PCT:", CAMPAIGN_SUBMISSION_LOCK_PCT)
+print("MAX_APPROVED_PER_USER:", MAX_APPROVED_PER_USER)
 
 # =========================
 # BOT / INTENTS
@@ -178,15 +184,9 @@ async def safe_reply(
 ):
     try:
         if interaction.response.is_done():
-            if view is None:
-                await interaction.followup.send(content, ephemeral=ephemeral)
-            else:
-                await interaction.followup.send(content, ephemeral=ephemeral, view=view)
+            await interaction.followup.send(content, ephemeral=ephemeral, view=view)
         else:
-            if view is None:
-                await interaction.response.send_message(content, ephemeral=ephemeral)
-            else:
-                await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
+            await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
     except Exception as e:
         print("⚠️ safe_reply falhou:", e)
 
@@ -197,10 +197,7 @@ async def notify_user(
     view: Optional[discord.ui.View] = None
 ):
     try:
-        if view is None:
-            await member.send(content)
-        else:
-            await member.send(content, view=view)
+        await member.send(content, view=view)
         return True
     except:
         if fallback_channel_id:
@@ -267,20 +264,29 @@ def normalize_tiktok_url(url: str) -> str:
         u = "https://" + u.lstrip("/")
     return u
 
-def make_proxy_configuration() -> Optional[Dict[str, Any]]:
-    """
-    Apify proxyConfiguration format.
-    Só envia se APIFY_USE_PROXY=1.
-    """
+def normalize_apify_actor_id(actor: str) -> str:
+    a = (actor or "").strip()
+    if not a:
+        return a
+    if "~" in a:
+        return a
+    if "/" in a:
+        return a.replace("/", "~", 1)
+    if "-" in a:
+        owner_guess = a.split("-", 1)[0].lower()
+        if owner_guess in ("clockworks", "apify"):
+            return owner_guess + "~" + a.split("-", 1)[1]
+    return a
+
+def build_proxy_configuration() -> Optional[dict]:
     if not APIFY_USE_PROXY:
         return None
-    proxy: Dict[str, Any] = {"useApifyProxy": True}
-    if APIFY_PROXY_COUNTRY:
-        proxy["apifyProxyCountry"] = APIFY_PROXY_COUNTRY
-    # groups é opcional e depende do teu plano (residential, etc)
+    cfg: Dict[str, Any] = {"useApifyProxy": True}
     if APIFY_PROXY_GROUPS:
-        proxy["apifyProxyGroups"] = APIFY_PROXY_GROUPS
-    return proxy
+        cfg["apifyProxyGroups"] = APIFY_PROXY_GROUPS
+    if APIFY_PROXY_COUNTRY:
+        cfg["apifyProxyCountry"] = APIFY_PROXY_COUNTRY
+    return cfg
 
 # =========================
 # DB INIT + MIGRATIONS
@@ -351,6 +357,14 @@ def init_db():
         except Exception as e:
             print("⚠️ MIGRATION campaigns.campaign_role_id:", e)
 
+    # evita spam de notificações quando campanha termina
+    if not _column_exists(conn, "campaigns", "ended_notified"):
+        try:
+            cur.execute("ALTER TABLE campaigns ADD COLUMN ended_notified INTEGER NOT NULL DEFAULT 0")
+            print("✅ MIGRATION: campaigns.ended_notified adicionado")
+        except Exception as e:
+            print("⚠️ MIGRATION campaigns.ended_notified:", e)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS submissions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,6 +387,7 @@ def init_db():
         user_id INTEGER NOT NULL,
         paid_kz INTEGER NOT NULL DEFAULT 0,
         total_views_paid INTEGER NOT NULL DEFAULT 0,
+        maxed_notified INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (campaign_id, user_id)
     )
     """)
@@ -492,7 +507,8 @@ def get_campaign_by_id(conn, campaign_id: int):
            category_id, details_channel_id, requirements_channel_id,
            submit_channel_id, submit_panel_message_id,
            leaderboard_channel_id, leaderboard_message_id,
-           campaign_role_id
+           campaign_role_id,
+           ended_notified
     FROM campaigns WHERE id=?
     """, (campaign_id,))
     return cur.fetchone()
@@ -567,12 +583,7 @@ def set_maxed_notified(campaign_id: int, user_id: int):
     conn.close()
 
 def reset_user_in_campaign(campaign_id: int, user_id: int):
-    """
-    Remove todo o progresso do user na campanha:
-    - apaga subs (pending/approved/rejected/removed)
-    - apaga campaign_users (paid_kz/views_paid/maxed_notified)
-    - remove membership (campaign_members)
-    """
+    # APAGA TUDO (submissions + stats + membership) => ao voltar a aderir, não conta nada antigo
     conn = db_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM submissions WHERE campaign_id=? AND user_id=?", (int(campaign_id), int(user_id)))
@@ -580,6 +591,82 @@ def reset_user_in_campaign(campaign_id: int, user_id: int):
     cur.execute("DELETE FROM campaign_members WHERE campaign_id=? AND user_id=?", (int(campaign_id), int(user_id)))
     conn.commit()
     conn.close()
+
+def get_user_submission_counts(campaign_id: int, user_id: int) -> Tuple[int, int, int]:
+    """(approved, pending, total_submitted)"""
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) as approved,
+            SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END)  as pending,
+            COUNT(*) as total
+        FROM submissions
+        WHERE campaign_id=? AND user_id=? AND status IN ('pending','approved')
+    """, (int(campaign_id), int(user_id)))
+    row = cur.fetchone() or (0, 0, 0)
+    conn.close()
+    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+
+async def notify_campaign_finished(campaign_id: int, winner_user_id: Optional[int], reason: str):
+    """
+    reason: 'budget' | 'manual'
+    - winner gets parabéns if budget
+    - all members get payments notice
+    """
+    guild = bot.get_guild(SERVER_ID)
+    if not guild:
+        return
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM campaigns WHERE id=?", (int(campaign_id),))
+    camp = cur.fetchone()
+    camp_name = str(camp[0]) if camp else f"Campanha {campaign_id}"
+
+    cur.execute("SELECT user_id FROM campaign_members WHERE campaign_id=?", (int(campaign_id),))
+    members = [int(r[0]) for r in cur.fetchall()]
+    conn.close()
+
+    if reason == "budget" and winner_user_id:
+        m = await fetch_member_safe(guild, int(winner_user_id))
+        if m:
+            await notify_user(
+                m,
+                f"🏁 **Parabéns!** Foste quem atingiu o limite do budget na campanha **{camp_name}**.\n\n{PAYMENTS_NOTICE}",
+                fallback_channel_id=CHAT_CHANNEL_ID
+            )
+
+    for uid in members:
+        m = await fetch_member_safe(guild, int(uid))
+        if m:
+            await notify_user(
+                m,
+                f"🏁 A campanha **{camp_name}** terminou ({'budget atingido' if reason=='budget' else 'finalizada pelo staff'}).\n\n{PAYMENTS_NOTICE}",
+                fallback_channel_id=CHAT_CHANNEL_ID
+            )
+
+def mark_campaign_ended_notified(campaign_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE campaigns SET ended_notified=1 WHERE id=?", (int(campaign_id),))
+    conn.commit()
+    conn.close()
+
+def get_campaign_basic(campaign_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, slug, platforms, content_types, audio_url,
+               rate_kz_per_1k, budget_total_kz, spent_kz,
+               max_payout_user_kz, max_posts_total, status,
+               category_id, submit_channel_id, leaderboard_channel_id, leaderboard_message_id,
+               campaign_role_id, ended_notified
+        FROM campaigns WHERE id=?
+    """, (int(campaign_id),))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 # =========================
 # CAMPANHA TESTE
@@ -664,6 +751,13 @@ def submission_approval_view(submission_id: int) -> discord.ui.View:
     v.add_item(discord.ui.Button(label="❌ Rejeitar link", style=discord.ButtonStyle.red, custom_id=f"vz:sub:reject:{submission_id}"))
     return v
 
+class ChooseSocialView(discord.ui.View):
+    def __init__(self, code: str):
+        super().__init__(timeout=120)
+        self.add_item(discord.ui.Button(label="TikTok", style=discord.ButtonStyle.primary, custom_id=f"vz:connect:tiktok:{code}"))
+        self.add_item(discord.ui.Button(label="Instagram", style=discord.ButtonStyle.primary, custom_id=f"vz:connect:instagram:{code}"))
+        self.add_item(discord.ui.Button(label="YouTube", style=discord.ButtonStyle.primary, custom_id=f"vz:connect:youtube:{code}"))
+
 # =========================
 # SUPORTE
 # =========================
@@ -747,7 +841,6 @@ class UsernameModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         user_id = interaction.user.id
         username = str(self.username.value).strip()
-
         upsert_verification_request(user_id=user_id, social=self.social, username=username, code=self.code, status="pending")
 
         await safe_reply(
@@ -828,10 +921,8 @@ class SubmitLinkModal(discord.ui.Modal):
         camp_id         = int(row[0])
         name            = str(row[1])
         platforms       = str(row[3])
-        rate            = int(row[6])
         budget_total    = int(row[7])
         spent_kz        = int(row[8])
-        max_user_kz     = int(row[9])
         max_posts_total = int(row[10])
         status          = str(row[11])
 
@@ -844,14 +935,6 @@ class SubmitLinkModal(discord.ui.Modal):
             return await safe_reply(interaction, "⚠️ Campanha está **quase cheia (95%)**. Submissões fechadas.", ephemeral=True)
 
         cur = conn.cursor()
-
-        # limite do user
-        cur.execute("SELECT COALESCE(paid_kz,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
-                    (int(camp_id), interaction.user.id))
-        paid_kz = int((cur.fetchone() or [0])[0])
-        if paid_kz >= int(max_user_kz):
-            conn.close()
-            return await safe_reply(interaction, f"⛔ Já atingiste o teu limite (**{max_user_kz:,} Kz**). Não podes submeter mais vídeos.", ephemeral=True)
 
         url = str(self.url.value).strip()
         if not url.startswith("http://") and not url.startswith("https://"):
@@ -867,7 +950,6 @@ class SubmitLinkModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, f"❌ Esta campanha só aceita: **{', '.join([p.upper() for p in allowed])}**.", ephemeral=True)
 
-        # limite total de posts da campanha
         cur.execute("""
         SELECT COUNT(*)
         FROM submissions
@@ -905,7 +987,13 @@ class SubmitLinkModal(discord.ui.Modal):
                 view=submission_approval_view(submission_id)
             )
 
-        await safe_reply(interaction, "✅ Link submetido! Aguarda aprovação do staff.", ephemeral=True)
+        # pode submeter > 10, mas só 10 aprovados (avisinho)
+        approved, _, _ = get_user_submission_counts(int(camp_id), int(interaction.user.id))
+        extra = ""
+        if approved >= MAX_APPROVED_PER_USER:
+            extra = f"\n\n⚠️ Nota: já tens **{MAX_APPROVED_PER_USER} aprovados**. Este link pode não ser aprovado."
+
+        await safe_reply(interaction, "✅ Link submetido! Aguarda aprovação do staff." + extra, ephemeral=True)
 
 class RemoveLinkModal(discord.ui.Modal):
     def __init__(self, campaign_id: int):
@@ -959,7 +1047,7 @@ class RemoveLinkModal(discord.ui.Modal):
         await safe_reply(interaction, "✅ Vídeo retirado. Ele deixa de ser contado/atualizado.", ephemeral=True)
 
 # =========================
-# CAMPAIGN WORKSPACE PRIVADO (SÓ NO ADERIR)
+# CAMPANHA WORKSPACE PRIVADO
 # =========================
 async def ensure_campaign_role(guild: discord.Guild, campaign_id: int, slug: str, existing_role_id: Optional[int]) -> discord.Role:
     role = None
@@ -1091,8 +1179,8 @@ async def campanha(ctx):
     INSERT OR IGNORE INTO campaigns
     (name, slug, platforms, content_types, audio_url, rate_kz_per_1k,
      budget_total_kz, max_payout_user_kz, max_posts_total,
-     campaigns_channel_id, created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+     campaigns_channel_id, created_at, ended_notified)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?, ?, 0)
     """, (
         c["name"], c["slug"], c["platforms"], c["content_types"], c["audio_url"],
         c["rate_kz_per_1k"], c["budget_total_kz"], c["max_payout_user_kz"], c["max_posts_total"],
@@ -1135,19 +1223,54 @@ async def refreshnow(ctx):
 async def debugviews(ctx, url: str):
     if not APIFY_TOKEN:
         return await ctx.send("⚠️ APIFY_TOKEN não está definido no Render.")
-    await ctx.send("⏳ A testar no Apify…")
+
     plat = detect_platform(url)
     if plat == "tiktok":
         url = normalize_tiktok_url(url)
 
+    actor_tk = normalize_apify_actor_id(APIFY_ACTOR_TIKTOK)
+    actor_ig = normalize_apify_actor_id(APIFY_ACTOR_INSTAGRAM)
+
     await ctx.send(
-        f"URL normalizado:\n{url}\n"
-        f"Actor TikTok: `{APIFY_ACTOR_TIKTOK}`\n"
-        f"Proxy: `{APIFY_USE_PROXY}` country=`{APIFY_PROXY_COUNTRY}` groups=`{','.join(APIFY_PROXY_GROUPS)}`"
+        "⏳ A testar no Apify…\n"
+        f"URL normalizado:\n{url}\n\n"
+        f"Actor TikTok (final): `{actor_tk}`\n"
+        f"Actor Instagram (final): `{actor_ig}`\n"
+        f"Proxy: {APIFY_USE_PROXY} country={APIFY_PROXY_COUNTRY} groups={APIFY_PROXY_GROUPS}"
     )
 
     v = await apify_get_views_for_url(url)
     await ctx.send(f"📊 Views devolvidas: **{v}**")
+
+@commands.has_permissions(administrator=True)
+@bot.command()
+async def endcampaign(ctx, campaign_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT status, ended_notified FROM campaigns WHERE id=?", (int(campaign_id),))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send("❌ Campanha não encontrada.")
+    ended_notified = int(row[1] or 0)
+
+    cur.execute("UPDATE campaigns SET status='ended' WHERE id=?", (int(campaign_id),))
+    conn.commit()
+    conn.close()
+
+    if ended_notified == 0:
+        mark_campaign_ended_notified(int(campaign_id))
+        await notify_campaign_finished(int(campaign_id), winner_user_id=None, reason="manual")
+
+    await update_leaderboard_for_campaign(int(campaign_id))
+    await ctx.send(f"✅ Campanha {campaign_id} terminada manualmente e notificações enviadas.")
+
+@commands.has_permissions(administrator=True)
+@bot.command()
+async def kickfromcampaign(ctx, campaign_id: int, user: discord.Member):
+    reset_user_in_campaign(int(campaign_id), int(user.id))
+    await update_leaderboard_for_campaign(int(campaign_id))
+    await ctx.send(f"✅ {user.mention} removido da campanha {campaign_id} e leaderboard atualizado.")
 
 # =========================
 # REATTACH PANELS
@@ -1195,7 +1318,7 @@ async def reattach_submit_panels():
             pass
 
 # =========================
-# LEADERBOARD (Kz pagos + views atuais)
+# LEADERBOARD
 # =========================
 async def update_leaderboard_for_campaign(campaign_id: int):
     guild = bot.get_guild(SERVER_ID)
@@ -1215,12 +1338,15 @@ async def update_leaderboard_for_campaign(campaign_id: int):
 
     lb_ch_id, lb_msg_id, name, spent, budget, status, rate = camp
 
+    # ✅ remove do leaderboard quem saiu: join com campaign_members
     cur.execute("""
     SELECT s.user_id,
            COALESCE(SUM(s.views_current),0) AS views_current_sum,
            COALESCE(cu.paid_kz,0) AS paid_kz,
            COALESCE(cu.total_views_paid,0) AS views_paid
     FROM submissions s
+    JOIN campaign_members cm
+      ON cm.campaign_id = s.campaign_id AND cm.user_id = s.user_id
     LEFT JOIN campaign_users cu
       ON cu.campaign_id = s.campaign_id AND cu.user_id = s.user_id
     WHERE s.campaign_id=? AND s.status='approved'
@@ -1261,20 +1387,27 @@ async def update_leaderboard_for_campaign(campaign_id: int):
         pass
 
 # =========================
-# APIFY: obter views (robusto + proxy opcional)
+# APIFY
 # =========================
 async def apify_run(actor: str, payload: dict) -> Optional[dict]:
     if not APIFY_TOKEN:
         return None
 
-    run_url = f"https://api.apify.com/v2/acts/{actor}/runs?token={APIFY_TOKEN}"
+    actor_id = normalize_apify_actor_id(actor)
+    run_url = f"https://api.apify.com/v2/acts/{actor_id}/runs?token={APIFY_TOKEN}"
+
+    proxy_cfg = build_proxy_configuration()
+    if proxy_cfg:
+        payload = dict(payload or {})
+        payload["proxyConfiguration"] = proxy_cfg
+
     try:
         session = await get_http_session()
 
         async with session.post(run_url, json=payload) as r:
             txt = await r.text()
             if r.status >= 400:
-                print(f"⚠️ APIFY POST status={r.status} actor={actor} body={txt[:900]}")
+                print(f"⚠️ APIFY POST status={r.status} actor={actor_id} body={txt[:1200]}")
                 return None
             data = await r.json()
 
@@ -1287,11 +1420,11 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
 
         status = None
         last_run_info = None
-        for _ in range(45):
+        for _ in range(35):
             async with session.get(f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}") as rr:
                 rr_txt = await rr.text()
                 if rr.status >= 400:
-                    print(f"⚠️ APIFY RUN status={rr.status} body={rr_txt[:900]}")
+                    print(f"⚠️ APIFY RUN status={rr.status} body={rr_txt[:1200]}")
                     return None
                 rd = await rr.json()
                 last_run_info = (rd.get("data") or {})
@@ -1309,7 +1442,7 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
         ) as ri:
             ri_txt = await ri.text()
             if ri.status >= 400:
-                print(f"⚠️ APIFY DATASET status={ri.status} body={ri_txt[:900]}")
+                print(f"⚠️ APIFY DATASET status={ri.status} body={ri_txt[:1200]}")
                 return None
             items = await ri.json()
 
@@ -1324,18 +1457,14 @@ async def apify_run(actor: str, payload: dict) -> Optional[dict]:
         return None
 
 def extract_views_from_item(item: dict) -> Optional[int]:
-    """
-    Os actors mudam os nomes dos campos.
-    Esta função tenta vários caminhos comuns.
-    """
     if not item or not isinstance(item, dict):
         return None
 
-    # campos diretos
     candidates = [
         "playCount", "plays", "views", "viewCount", "videoViewCount", "video_view_count",
-        "videoPlayCount", "video_play_count", "play_count", "view_count"
+        "videoPlayCount", "video_play_count", "playCountText"
     ]
+
     for k in candidates:
         v = item.get(k)
         if isinstance(v, int):
@@ -1345,10 +1474,9 @@ def extract_views_from_item(item: dict) -> Optional[int]:
             if hv is not None:
                 return hv
 
-    # stats
-    stats = item.get("stats") or item.get("statistics") or {}
+    stats = item.get("stats") or {}
     if isinstance(stats, dict):
-        for k in ["playCount", "viewCount", "views", "videoViewCount", "play_count", "view_count"]:
+        for k in ["playCount", "viewCount", "views", "videoViewCount", "plays"]:
             v = stats.get(k)
             if isinstance(v, int):
                 return v
@@ -1357,29 +1485,14 @@ def extract_views_from_item(item: dict) -> Optional[int]:
                 if hv is not None:
                     return hv
 
-    # videoMeta / video / itemStruct
-    for path in [
-        ("videoMeta", "playCount"),
-        ("videoMeta", "play_count"),
-        ("video", "stats", "playCount"),
-        ("itemStruct", "stats", "playCount"),
-        ("itemStruct", "stats", "play_count"),
-        ("itemStruct", "stats", "playCount"),
-        ("itemStruct", "stats", "viewCount"),
-    ]:
-        cur = item
-        ok = True
-        for p in path:
-            if isinstance(cur, dict) and p in cur:
-                cur = cur[p]
-            else:
-                ok = False
-                break
-        if ok:
-            if isinstance(cur, int):
-                return cur
-            if isinstance(cur, str):
-                hv = parse_human_number(cur)
+    vmeta = item.get("videoMeta") or {}
+    if isinstance(vmeta, dict):
+        for k in ["playCount", "viewCount", "views"]:
+            v = vmeta.get(k)
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str):
+                hv = parse_human_number(v)
                 if hv is not None:
                     return hv
 
@@ -1387,23 +1500,15 @@ def extract_views_from_item(item: dict) -> Optional[int]:
 
 async def apify_get_views_for_url(url: str) -> Optional[int]:
     platform = detect_platform(url)
-    proxy_cfg = make_proxy_configuration()
 
     if platform == "tiktok":
         clean = normalize_tiktok_url(url)
-
         payloads = [
+            {"postURLs": [clean], "resultsPerPage": 1, "scrapeRelatedVideos": False},
             {"startUrls": [{"url": clean}], "maxItems": 1},
             {"directUrls": [clean], "resultsPerPage": 1},
             {"videoUrls": [clean]},
-            {"postURLs": [clean]},
         ]
-
-        # ✅ injeta proxyConfiguration se ativado
-        if proxy_cfg:
-            for p in payloads:
-                p["proxyConfiguration"] = proxy_cfg
-
         for p in payloads:
             item = await apify_run(APIFY_ACTOR_TIKTOK, p)
             v = extract_views_from_item(item) if item else None
@@ -1416,10 +1521,6 @@ async def apify_get_views_for_url(url: str) -> Optional[int]:
             {"directUrls": [url], "resultsType": "posts", "resultsLimit": 1},
             {"startUrls": [{"url": url}], "resultsLimit": 1},
         ]
-        if proxy_cfg:
-            for p in payloads:
-                p["proxyConfiguration"] = proxy_cfg
-
         for p in payloads:
             item = await apify_run(APIFY_ACTOR_INSTAGRAM, p)
             v = extract_views_from_item(item) if item else None
@@ -1430,18 +1531,17 @@ async def apify_get_views_for_url(url: str) -> Optional[int]:
     return None
 
 # =========================
-# VIEWS REFRESH (shared)
+# VIEWS REFRESH
 # =========================
 async def refresh_views_once() -> None:
     if not APIFY_TOKEN:
-        print("⚠️ refresh_views_once: APIFY_TOKEN vazio (não atualiza).")
         return
 
     conn = db_conn()
     cur = conn.cursor()
     cur.execute("""
     SELECT s.id, s.campaign_id, s.user_id, s.post_url, s.paid_views,
-           c.rate_kz_per_1k, c.budget_total_kz, c.spent_kz, c.max_payout_user_kz, c.status
+           c.rate_kz_per_1k, c.budget_total_kz, c.spent_kz, c.max_payout_user_kz, c.status, COALESCE(c.ended_notified,0)
     FROM submissions s
     JOIN campaigns c ON c.id = s.campaign_id
     WHERE s.status='approved' AND c.status='active'
@@ -1449,14 +1549,24 @@ async def refresh_views_once() -> None:
     rows = cur.fetchall()
     conn.close()
 
-    if not rows:
-        print("ℹ️ refresh_views_once: zero submissions aprovadas/ativas.")
-        return
-
     touched_campaigns = set()
 
     for (sub_id, camp_id, user_id, url, paid_views,
-         rate, budget_total, spent_kz, max_user_kz, camp_status) in rows:
+         rate, budget_total, spent_kz, max_user_kz, camp_status, ended_notified) in rows:
+
+        # se já acabou budget mas ainda está active por algum motivo
+        remaining_budget_now = max(0, int(budget_total) - int(spent_kz))
+        if remaining_budget_now <= 0:
+            connx = db_conn()
+            cx = connx.cursor()
+            cx.execute("UPDATE campaigns SET status='ended' WHERE id=?", (int(camp_id),))
+            connx.commit()
+            connx.close()
+            touched_campaigns.add(int(camp_id))
+            if int(ended_notified) == 0:
+                mark_campaign_ended_notified(int(camp_id))
+                await notify_campaign_finished(int(camp_id), winner_user_id=None, reason="budget")
+            continue
 
         views = await apify_get_views_for_url(url)
         if views is None:
@@ -1466,14 +1576,12 @@ async def refresh_views_once() -> None:
         conn2 = db_conn()
         cur2 = conn2.cursor()
 
-        # update views_current
         cur2.execute("UPDATE submissions SET views_current=? WHERE id=?", (int(views), int(sub_id)))
 
         payable_total = (int(views) // 1000) * 1000
         to_pay_views = payable_total - int(paid_views)
 
-        # se não há mais 1k novo, só atualiza leaderboard
-        if to_pay_views < 1000:
+        if to_pay_views < 1000 or int(rate) <= 0:
             conn2.commit()
             conn2.close()
             touched_campaigns.add(int(camp_id))
@@ -1481,14 +1589,11 @@ async def refresh_views_once() -> None:
 
         to_pay_kz = (to_pay_views // 1000) * int(rate)
 
-        # user already paid
-        cur2.execute(
-            "SELECT COALESCE(paid_kz,0), COALESCE(maxed_notified,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
-            (int(camp_id), int(user_id))
-        )
+        cur2.execute("SELECT COALESCE(paid_kz,0), COALESCE(maxed_notified,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
+                     (int(camp_id), int(user_id)))
         rowu = cur2.fetchone()
         already_paid_kz = int(rowu[0]) if rowu else 0
-        maxed_notified = int(rowu[1]) if rowu else 0
+        maxed_notified_u = int(rowu[1]) if rowu else 0
 
         remaining_user_kz = max(0, int(max_user_kz) - already_paid_kz)
         if remaining_user_kz <= 0:
@@ -1503,13 +1608,6 @@ async def refresh_views_once() -> None:
             to_pay_kz = max_blocks * int(rate)
 
         remaining_budget = max(0, int(budget_total) - int(spent_kz))
-        if remaining_budget <= 0:
-            cur2.execute("UPDATE campaigns SET status='ended' WHERE id=?", (int(camp_id),))
-            conn2.commit()
-            conn2.close()
-            touched_campaigns.add(int(camp_id))
-            continue
-
         if to_pay_kz > remaining_budget:
             max_blocks = remaining_budget // int(rate)
             to_pay_views = max_blocks * 1000
@@ -1521,7 +1619,6 @@ async def refresh_views_once() -> None:
             touched_campaigns.add(int(camp_id))
             continue
 
-        # apply payment
         cur2.execute("""
         INSERT INTO campaign_users (campaign_id, user_id, paid_kz, total_views_paid, maxed_notified)
         VALUES (?, ?, ?, ?, 0)
@@ -1540,8 +1637,9 @@ async def refresh_views_once() -> None:
         conn2.close()
         touched_campaigns.add(int(camp_id))
 
+        # notificar max por pessoa (já tinhas)
         new_paid = already_paid_kz + int(to_pay_kz)
-        if new_paid >= int(max_user_kz) and maxed_notified == 0:
+        if new_paid >= int(max_user_kz) and maxed_notified_u == 0:
             guild = bot.get_guild(SERVER_ID)
             if guild:
                 member = await fetch_member_safe(guild, int(user_id))
@@ -1553,6 +1651,21 @@ async def refresh_views_once() -> None:
                         fallback_channel_id=CHAT_CHANNEL_ID
                     )
                     set_maxed_notified(int(camp_id), int(user_id))
+
+        # ✅ se este pagamento fechou o budget: termina e notifica 1x
+        new_spent = int(spent_kz) + int(to_pay_kz)
+        if new_spent >= int(budget_total):
+            connz = db_conn()
+            cz = connz.cursor()
+            cz.execute("SELECT COALESCE(ended_notified,0) FROM campaigns WHERE id=?", (int(camp_id),))
+            en = int((cz.fetchone() or [0])[0] or 0)
+            cz.execute("UPDATE campaigns SET status='ended' WHERE id=?", (int(camp_id),))
+            connz.commit()
+            connz.close()
+
+            if en == 0:
+                mark_campaign_ended_notified(int(camp_id))
+                await notify_campaign_finished(int(camp_id), winner_user_id=int(user_id), reason="budget")
 
     for cid in touched_campaigns:
         await update_leaderboard_for_campaign(int(cid))
@@ -1570,179 +1683,170 @@ async def before_refresh_views():
     await bot.wait_until_ready()
 
 # =========================
-# INTERACTIONS ROUTER
+# INTERACTIONS ROUTER (BOTÕES)
 # =========================
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     try:
-        if interaction.type != discord.InteractionType.component:
-            return
+        if interaction.type == discord.InteractionType.component:
+            data = interaction.data or {}
+            custom_id = (data.get("custom_id") or "").strip()
+            if not custom_id:
+                return
 
-        cid = (interaction.data or {}).get("custom_id")
-        if not cid:
-            return
+            guild = interaction.guild or bot.get_guild(SERVER_ID)
+            if not guild:
+                return
 
-        # CONNECT
-        if cid == "vz:connect":
-            view = discord.ui.View(timeout=120)
-            select = discord.ui.Select(
-                placeholder="Escolhe a rede social",
-                options=[
-                    discord.SelectOption(label="TikTok", emoji="🎵", value="TikTok"),
-                    discord.SelectOption(label="Instagram", emoji="📸", value="Instagram"),
-                    discord.SelectOption(label="YouTube", emoji="📺", value="YouTube"),
-                ],
-            )
-
-            async def _cb(i: discord.Interaction):
-                social = (i.data["values"][0] if i.data and "values" in i.data else "TikTok")
+            # -------- CONNECT FLOW --------
+            if custom_id == "vz:connect":
                 code = generate_verification_code()
-                await i.response.send_modal(UsernameModal(social=social, code=code))
-
-            select.callback = _cb
-            view.add_item(select)
-            return await safe_reply(interaction, "Escolhe a rede social:", ephemeral=True, view=view)
-
-        if cid == "vz:view_account":
-            await safe_defer(interaction, ephemeral=True)
-            row = get_verification_request(interaction.user.id)
-            if not row:
-                return await safe_reply(interaction, "❌ Nenhum pedido encontrado.", ephemeral=True)
-            _, social, username, code, status, _, _ = row
-            msg = (
-                ("✅ **Conta verificada**\n" if status == "verified" else "⏳ **Conta ainda não verificada**\n")
-                + f"📱 Rede: {social}\n"
-                + f"🏷️ Username: {username}\n"
-                + f"🔑 Código: `{code}`\n"
-                + ("" if status == "verified" else f"📌 Status: **{status.upper()}**")
-            )
-            return await safe_reply(interaction, msg, ephemeral=True)
-
-        # SUPORTE
-        if cid == "vz:support:campaign":
-            return await interaction.response.send_modal(SupportCampaignModal())
-        if cid == "vz:support:question":
-            return await interaction.response.send_modal(SupportQuestionModal())
-
-        # VERIFY
-        if cid.startswith("vz:verify:"):
-            await safe_defer(interaction, ephemeral=True)
-            _, _, action, user_id = cid.split(":", 3)
-            user_id = int(user_id)
-
-            if interaction.user.id != ADMIN_USER_ID:
-                return await safe_reply(interaction, "⛔ Só o admin pode aprovar/rejeitar.", ephemeral=True)
-
-            row = get_verification_request(user_id)
-            if not row:
-                return await safe_reply(interaction, "⚠️ Pedido não existe no DB.", ephemeral=True)
-            _, social, username, code, status, _, _ = row
-            if status != "pending":
-                return await safe_reply(interaction, f"⚠️ Pedido já está como **{status}**.", ephemeral=True)
-
-            guild = bot.get_guild(SERVER_ID)
-            member = await fetch_member_safe(guild, user_id) if guild else None
-            if not guild or not member:
-                return await safe_reply(interaction, "⚠️ Não consegui buscar guild/membro.", ephemeral=True)
-
-            if action == "approve":
-                role = guild.get_role(VERIFICADO_ROLE_ID)
-                if not role:
-                    return await safe_reply(interaction, "⚠️ Cargo 'Verificado' não encontrado.", ephemeral=True)
-                try:
-                    await member.add_roles(role, reason="Verificação aprovada")
-                except discord.Forbidden:
-                    return await safe_reply(interaction, "⛔ Bot sem permissões para dar cargo.", ephemeral=True)
-
-                set_verification_status(user_id, "verified")
-
-                await notify_user(
-                    member,
-                    "✅ **Verificação aprovada!**\n\n👉 Agora adiciona o teu IBAN (botões abaixo):",
-                    fallback_channel_id=LIGAR_CONTA_E_VERIFICAR_CHANNEL_ID,
-                    view=IbanButtons()
+                await safe_reply(
+                    interaction,
+                    "Escolhe a rede social para ligar.\n\n"
+                    f"🔑 O teu código será: `{code}`",
+                    ephemeral=True,
+                    view=ChooseSocialView(code)
                 )
+                return
 
+            if custom_id.startswith("vz:connect:"):
+                # vz:connect:<social>:<code>
+                parts = custom_id.split(":")
+                if len(parts) >= 4:
+                    social = parts[2]
+                    code = parts[3]
+                    await interaction.response.send_modal(UsernameModal(social=social, code=code))
+                else:
+                    await safe_reply(interaction, "⚠️ Botão inválido.", ephemeral=True)
+                return
+
+            if custom_id == "vz:view_account":
+                # mostra status + iban
+                vr = get_verification_request(int(interaction.user.id))
+                iban = get_iban(int(interaction.user.id))
+                status = "NÃO LIGADO"
+                social = "-"
+                username = "-"
+                if vr:
+                    _, social, username, code, st, _, _ = vr
+                    status = str(st).upper()
+                iban_txt = "NÃO DEFINIDO"
+                if iban and iban[0]:
+                    raw = str(iban[0])
+                    iban_txt = raw[:6] + "…" + raw[-4:] if len(raw) > 12 else raw
+
+                await safe_reply(
+                    interaction,
+                    "👤 **A tua conta**\n"
+                    f"📌 Status verificação: **{status}**\n"
+                    f"📱 Rede: **{social}**\n"
+                    f"🏷️ Username: **{username}**\n"
+                    f"🏦 IBAN: **{iban_txt}**",
+                    ephemeral=True
+                )
+                return
+
+            # -------- IBAN --------
+            if custom_id == "vz:iban:add":
+                member = await fetch_member_safe(guild, interaction.user.id)
+                if not member or not is_verified(member):
+                    return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para guardar IBAN.", ephemeral=True)
+                await interaction.response.send_modal(IbanModal())
+                return
+
+            if custom_id == "vz:iban:view":
+                member = await fetch_member_safe(guild, interaction.user.id)
+                if not member or not is_verified(member):
+                    return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para ver IBAN.", ephemeral=True)
+                row = get_iban(int(interaction.user.id))
+                if not row:
+                    return await safe_reply(interaction, "⚠️ Ainda não tens IBAN guardado.", ephemeral=True)
+                raw = str(row[0])
+                masked = raw[:6] + "…" + raw[-4:] if len(raw) > 12 else raw
+                await safe_reply(interaction, f"🏦 O teu IBAN: **{masked}**", ephemeral=True)
+                return
+
+            # -------- SUPPORT --------
+            if custom_id == "vz:support:campaign":
+                await interaction.response.send_modal(SupportCampaignModal())
+                return
+            if custom_id == "vz:support:question":
+                await interaction.response.send_modal(SupportQuestionModal())
+                return
+
+            # -------- VERIFY APPROVAL --------
+            if custom_id.startswith("vz:verify:approve:") or custom_id.startswith("vz:verify:reject:"):
+                is_approve = custom_id.startswith("vz:verify:approve:")
+                user_id = int(custom_id.split(":")[-1])
+
+                # só admin
+                if interaction.user.id != ADMIN_USER_ID and not getattr(interaction.user, "guild_permissions", None).administrator:
+                    return await safe_reply(interaction, "⛔ Sem permissão.", ephemeral=True)
+
+                target_member = await fetch_member_safe(guild, user_id)
+                if not target_member:
+                    return await safe_reply(interaction, "⚠️ Utilizador não encontrado.", ephemeral=True)
+
+                if is_approve:
+                    role = guild.get_role(VERIFICADO_ROLE_ID)
+                    if role:
+                        try:
+                            await target_member.add_roles(role, reason="Viralizzaa verification approved")
+                        except:
+                            pass
+                    set_verification_status(user_id, "approved")
+                    await notify_user(target_member, "✅ A tua verificação foi **aprovada**!", fallback_channel_id=CHAT_CHANNEL_ID)
+                    await safe_reply(interaction, "✅ Verificação aprovada.", ephemeral=True)
+                else:
+                    set_verification_status(user_id, "rejected")
+                    await notify_user(target_member, "❌ A tua verificação foi **rejeitada**.", fallback_channel_id=CHAT_CHANNEL_ID)
+                    await safe_reply(interaction, "✅ Verificação rejeitada.", ephemeral=True)
+
+                # remove botões da mensagem
                 try:
                     await interaction.message.edit(view=None)
                 except:
                     pass
-                return await safe_reply(interaction, "✅ Aprovado e cargo atribuído.", ephemeral=True)
+                return
 
-            if action == "reject":
-                set_verification_status(user_id, "rejected")
-                try:
-                    await interaction.message.edit(view=None)
-                except:
-                    pass
-                return await safe_reply(interaction, "❌ Rejeitado.", ephemeral=True)
+            # -------- JOIN CAMPAIGN --------
+            if custom_id == "vz:camp:join":
+                member = await fetch_member_safe(guild, interaction.user.id)
+                if not member or not is_verified(member):
+                    return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para aderir a campanhas.", ephemeral=True)
 
-        # IBAN
-        if cid == "vz:iban:add":
-            guild = interaction.guild or bot.get_guild(SERVER_ID)
-            member = await fetch_member_safe(guild, interaction.user.id) if guild else None
-            if not guild or not member:
-                return await safe_reply(interaction, "⚠️ Servidor não encontrado.", ephemeral=True)
-            if not is_verified(member):
-                return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para adicionar IBAN.", ephemeral=True)
-            return await interaction.response.send_modal(IbanModal())
+                # descobrir campanha pelo canal da mensagem (post no canal de campanhas)
+                # vamos pegar a última campanha com post_message_id igual ao message.id (mais seguro)
+                msg_id = getattr(interaction.message, "id", None)
+                if not msg_id:
+                    return await safe_reply(interaction, "⚠️ Não consegui identificar a campanha.", ephemeral=True)
 
-        if cid == "vz:iban:view":
-            await safe_defer(interaction, ephemeral=True)
-            guild = interaction.guild or bot.get_guild(SERVER_ID)
-            member = await fetch_member_safe(guild, interaction.user.id) if guild else None
-            if not guild or not member:
-                return await safe_reply(interaction, "⚠️ Servidor não encontrado.", ephemeral=True)
-            if not is_verified(member):
-                return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para ver IBAN.", ephemeral=True)
-            row = get_iban(interaction.user.id)
-            if not row:
-                return await safe_reply(interaction, "Ainda não tens IBAN guardado.", ephemeral=True)
-            iban, updated_at = row
-            return await safe_reply(interaction, f"✅ Teu IBAN: **{iban}**\n🕒 Atualizado: {updated_at}", ephemeral=True)
+                conn = db_conn()
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, name, slug, platforms, content_types, audio_url,
+                           rate_kz_per_1k, budget_total_kz, max_payout_user_kz, max_posts_total,
+                           status, category_id, campaign_role_id
+                    FROM campaigns
+                    WHERE post_message_id=?
+                    LIMIT 1
+                """, (int(msg_id),))
+                camp = cur.fetchone()
+                conn.close()
+                if not camp:
+                    return await safe_reply(interaction, "❌ Campanha não encontrada para este post.", ephemeral=True)
 
-        # JOIN CAMPAIGN
-        if cid == "vz:camp:join":
-            await safe_defer(interaction, ephemeral=True)
-            guild = interaction.guild or bot.get_guild(SERVER_ID)
-            member = await fetch_member_safe(guild, interaction.user.id) if guild else None
-            if not guild or not member:
-                return await safe_reply(interaction, "⚠️ Servidor não encontrado.", ephemeral=True)
-            if not is_verified(member):
-                return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para aderir.", ephemeral=True)
+                (camp_id, name, slug, platforms, content_types, audio_url,
+                 rate, budget_total, max_user_kz, max_posts_total,
+                 status, category_id, campaign_role_id) = camp
 
-            post_id = interaction.message.id
+                if str(status) != "active":
+                    return await safe_reply(interaction, "⚠️ Esta campanha já terminou.", ephemeral=True)
 
-            conn = db_conn()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT id, name, slug, platforms, content_types, audio_url, rate_kz_per_1k,
-                       budget_total_kz, spent_kz, max_payout_user_kz, max_posts_total,
-                       status, category_id, campaign_role_id
-                FROM campaigns WHERE post_message_id=?
-            """, (post_id,))
-            row = cur.fetchone()
-            conn.close()
-
-            if not row:
-                return await safe_reply(interaction, "❌ Campanha não encontrada no DB. Admin: `!campanha`.", ephemeral=True)
-
-            camp_id, name, slug, platforms, content_types, audio_url, rate, budget_total, spent_kz, max_user_kz, max_posts_total, status, category_id, role_id = row
-            if status != "active":
-                return await safe_reply(interaction, "⚠️ Esta campanha já terminou.", ephemeral=True)
-
-            add_campaign_member(int(camp_id), int(interaction.user.id))
-
-            campaign_role = await ensure_campaign_role(guild, int(camp_id), str(slug), int(role_id) if role_id else None)
-
-            if campaign_role not in member.roles:
-                try:
-                    await member.add_roles(campaign_role, reason="Aderiu à campanha")
-                except discord.Forbidden:
-                    return await safe_reply(interaction, "⛔ Bot sem permissões para atribuir o role da campanha.", ephemeral=True)
-
-            try:
-                cat_id = await ensure_campaign_workspace_private(
+                # cria role + workspace (se não existir)
+                campaign_role = await ensure_campaign_role(guild, int(camp_id), str(slug), campaign_role_id)
+                await ensure_campaign_workspace_private(
                     guild=guild,
                     camp_id=int(camp_id),
                     name=str(name),
@@ -1754,205 +1858,233 @@ async def on_interaction(interaction: discord.Interaction):
                     budget_total=int(budget_total),
                     max_user_kz=int(max_user_kz),
                     max_posts_total=int(max_posts_total),
-                    category_id=int(category_id) if category_id else None,
+                    category_id=category_id,
                     campaign_role=campaign_role
                 )
-            except Exception:
-                traceback.print_exc()
-                return await safe_reply(interaction, "⚠️ Aderiste, mas falhei a criar a categoria/canais (vê logs/permissões).", ephemeral=True)
 
-            await update_leaderboard_for_campaign(int(camp_id))
-            return await safe_reply(interaction, f"✅ Aderiste! Agora tens acesso à categoria: <#{cat_id}>", ephemeral=True)
+                # add member record
+                add_campaign_member(int(camp_id), int(interaction.user.id))
 
-        # LEAVE/RESET CAMPAIGN
-        if cid.startswith("vz:camp:leave:"):
-            await safe_defer(interaction, ephemeral=True)
-            parts = cid.split(":")
-            if len(parts) != 4:
+                # dar role
+                try:
+                    await member.add_roles(campaign_role, reason="Joined campaign")
+                except:
+                    pass
+
+                await safe_reply(
+                    interaction,
+                    f"✅ Aderiste à campanha **{name}**!\n\n"
+                    f"Vai ao canal de submissão da campanha para enviar links.",
+                    ephemeral=True
+                )
                 return
-            camp_id = int(parts[3])
 
-            guild = interaction.guild or bot.get_guild(SERVER_ID)
-            if not guild:
-                return await safe_reply(interaction, "⚠️ Servidor não encontrado.", ephemeral=True)
+            # -------- LEAVE/RESET CAMPAIGN --------
+            if custom_id.startswith("vz:camp:leave:"):
+                camp_id = int(custom_id.split(":")[-1])
 
-            member = await fetch_member_safe(guild, interaction.user.id)
-            if not member:
-                return await safe_reply(interaction, "⚠️ Não consegui buscar o teu utilizador.", ephemeral=True)
+                if not is_campaign_member(int(camp_id), int(interaction.user.id)):
+                    return await safe_reply(interaction, "⚠️ Tu não estás nesta campanha.", ephemeral=True)
 
-            conn = db_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT slug, campaign_role_id FROM campaigns WHERE id=?", (camp_id,))
-            crow = cur.fetchone()
-            conn.close()
+                # remover tudo (inclui leaderboard)
+                reset_user_in_campaign(int(camp_id), int(interaction.user.id))
 
-            if not crow:
-                return await safe_reply(interaction, "❌ Campanha não encontrada.", ephemeral=True)
+                # remover role da campanha (se existir)
+                row = get_campaign_basic(int(camp_id))
+                if row:
+                    campaign_role_id = row[16]
+                    if campaign_role_id:
+                        role = guild.get_role(int(campaign_role_id))
+                        mem = await fetch_member_safe(guild, interaction.user.id)
+                        if role and mem:
+                            try:
+                                await mem.remove_roles(role, reason="Left campaign reset")
+                            except:
+                                pass
 
-            slug, role_id = str(crow[0]), crow[1]
-
-            reset_user_in_campaign(camp_id, interaction.user.id)
-
-            if role_id:
-                r = guild.get_role(int(role_id))
-                if r and r in member.roles:
-                    try:
-                        await member.remove_roles(r, reason="Saiu da campanha (reset)")
-                    except discord.Forbidden:
-                        pass
-
-            await update_leaderboard_for_campaign(int(camp_id))
-            return await safe_reply(
-                interaction,
-                "✅ Saíste da campanha e o teu progresso foi **apagado**.\n"
-                "Podes voltar a aderir no post da campanha e testar do **0**.",
-                ephemeral=True
-            )
-
-        # SUBMIT buttons
-        if cid.startswith("vz:submit:"):
-            parts = cid.split(":")
-            if len(parts) != 4:
+                await update_leaderboard_for_campaign(int(camp_id))
+                await safe_reply(interaction, "✅ Saíste da campanha e foi feito reset (submissões/estatísticas apagadas).", ephemeral=True)
                 return
-            _, _, action, camp_id_s = parts
-            camp_id = int(camp_id_s)
 
-            if action == "open":
-                return await interaction.response.send_modal(SubmitLinkModal(camp_id))
-            if action == "remove":
-                return await interaction.response.send_modal(RemoveLinkModal(camp_id))
+            # -------- SUBMIT PANEL ACTIONS --------
+            if custom_id.startswith("vz:submit:open:"):
+                camp_id = int(custom_id.split(":")[-1])
+                await interaction.response.send_modal(SubmitLinkModal(camp_id))
+                return
 
-            if action == "stats":
-                await safe_defer(interaction, ephemeral=True)
+            if custom_id.startswith("vz:submit:remove:"):
+                camp_id = int(custom_id.split(":")[-1])
+                await interaction.response.send_modal(RemoveLinkModal(camp_id))
+                return
+
+            if custom_id.startswith("vz:submit:stats:"):
+                camp_id = int(custom_id.split(":")[-1])
+
+                if not is_campaign_member(int(camp_id), int(interaction.user.id)):
+                    return await safe_reply(interaction, "⛔ Primeiro tens de **aderir** à campanha.", ephemeral=True)
+
+                approved, pending, total = get_user_submission_counts(int(camp_id), int(interaction.user.id))
 
                 conn = db_conn()
                 cur = conn.cursor()
-
-                cur.execute("SELECT name, rate_kz_per_1k, budget_total_kz, spent_kz, max_payout_user_kz, status FROM campaigns WHERE id=?",
-                            (camp_id,))
-                camp = cur.fetchone()
-                if not camp:
-                    conn.close()
-                    return await safe_reply(interaction, "❌ Campanha não encontrada.", ephemeral=True)
-                name, rate, bt, sk, mx, st = camp
+                cur.execute("SELECT COALESCE(paid_kz,0), COALESCE(total_views_paid,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
+                            (int(camp_id), int(interaction.user.id)))
+                row = cur.fetchone() or (0, 0)
+                paid_kz, views_paid = int(row[0] or 0), int(row[1] or 0)
 
                 cur.execute("""
-                    SELECT post_url, platform, status, views_current, paid_views
+                    SELECT COALESCE(SUM(views_current),0)
                     FROM submissions
-                    WHERE campaign_id=? AND user_id=? AND status IN ('pending','approved')
-                    ORDER BY created_at DESC
-                    LIMIT 10
-                """, (camp_id, interaction.user.id))
-                subs = cur.fetchall()
-
-                cur.execute("SELECT COALESCE(paid_kz,0), COALESCE(total_views_paid,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
-                            (camp_id, interaction.user.id))
-                rowu = cur.fetchone() or (0, 0)
-                paid_kz, views_paid_total = int(rowu[0]), int(rowu[1])
-
+                    WHERE campaign_id=? AND user_id=? AND status='approved'
+                """, (int(camp_id), int(interaction.user.id)))
+                views_current_sum = int((cur.fetchone() or [0])[0] or 0)
                 conn.close()
 
-                progress = pct(int(sk), int(bt)) * 100.0
-                remaining = max(0, int(bt) - int(sk))
+                await safe_reply(
+                    interaction,
+                    "📊 **As tuas estatísticas nesta campanha**\n"
+                    f"✅ Aprovados: **{approved}/{MAX_APPROVED_PER_USER}**\n"
+                    f"⏳ Pendentes: **{pending}**\n"
+                    f"📥 Total submetidos (ativos): **{total}**\n\n"
+                    f"💰 Pago (estimado): **{paid_kz:,} Kz**\n"
+                    f"👁️ Views pagas: **{views_paid:,}**\n"
+                    f"👀 Views atuais (aprovados): **{views_current_sum:,}**",
+                    ephemeral=True
+                )
+                return
 
-                lines = [
-                    f"📊 **Estatísticas — {name}**",
-                    f"📌 Estado: **{st}**",
-                    "",
-                    f"💰 Campanha: **{int(sk):,}/{int(bt):,} Kz** (**{progress:.1f}%**) | Restante: **{remaining:,} Kz**",
-                    f"👤 Tu: **{paid_kz:,} Kz** | Views pagas: **{views_paid_total:,}** | Máx: **{int(mx):,} Kz**",
-                    "",
-                ]
+            # -------- SUBMISSION APPROVAL (STAFF) --------
+            if custom_id.startswith("vz:sub:approve:") or custom_id.startswith("vz:sub:reject:"):
+                is_approve = custom_id.startswith("vz:sub:approve:")
+                submission_id = int(custom_id.split(":")[-1])
 
-                if not subs:
-                    lines.append("Ainda não tens vídeos submetidos (ou estão removidos/rejeitados).")
-                else:
-                    lines.append("🎬 **Teus últimos vídeos (até 10):**")
-                    for (url, plat, stt, vcur, pviews) in subs:
-                        est_kz = (int(pviews) // 1000) * int(rate)
-                        lines.append(
-                            f"• **{plat.upper()}** [{stt}] — views atuais: **{int(vcur):,}** | views pagas: **{int(pviews):,}** | pago: **{est_kz:,} Kz**\n  {url}"
-                        )
+                if interaction.user.id != ADMIN_USER_ID and not getattr(interaction.user, "guild_permissions", None).administrator:
+                    return await safe_reply(interaction, "⛔ Sem permissão.", ephemeral=True)
 
-                return await safe_reply(interaction, "\n".join(lines), ephemeral=True)
+                conn = db_conn()
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT s.id, s.campaign_id, s.user_id, s.post_url, s.status,
+                           c.name, c.status
+                    FROM submissions s
+                    JOIN campaigns c ON c.id = s.campaign_id
+                    WHERE s.id=?
+                """, (int(submission_id),))
+                row = cur.fetchone()
+                if not row:
+                    conn.close()
+                    return await safe_reply(interaction, "❌ Submission não encontrada.", ephemeral=True)
 
-        # APPROVE/REJECT submission
-        if cid.startswith("vz:sub:"):
-            await safe_defer(interaction, ephemeral=True)
-            if interaction.user.id != ADMIN_USER_ID:
-                return await safe_reply(interaction, "⛔ Só o admin pode aprovar/rejeitar.", ephemeral=True)
+                sid, camp_id, user_id, post_url, st, camp_name, camp_status = row
+                camp_id = int(camp_id); user_id = int(user_id)
+                post_url = str(post_url)
 
-            _, _, action, sub_id = cid.split(":", 3)
-            sub_id = int(sub_id)
+                target_member = await fetch_member_safe(guild, user_id)
 
-            conn = db_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT id, campaign_id, user_id, post_url, platform, status FROM submissions WHERE id=?",
-                        (sub_id,))
-            srow = cur.fetchone()
-            if not srow:
-                conn.close()
-                return await safe_reply(interaction, "❌ Submission não encontrada.", ephemeral=True)
-
-            _, camp_id, user_id, url, platform, st = srow
-            if st != "pending":
-                conn.close()
-                return await safe_reply(interaction, f"⚠️ Já está como **{st}**.", ephemeral=True)
-
-            if action == "approve":
-                cur.execute("UPDATE submissions SET status='approved', approved_at=? WHERE id=?", (_now(), sub_id))
-                conn.commit()
-
-                # tenta views logo na aprovação
-                initial_views = None
-                if APIFY_TOKEN:
-                    try:
-                        initial_views = await apify_get_views_for_url(url)
-                    except:
-                        initial_views = None
-                if isinstance(initial_views, int) and initial_views >= 0:
-                    cur.execute("UPDATE submissions SET views_current=? WHERE id=?", (int(initial_views), sub_id))
+                # se user saiu, rejeita e remove
+                if not is_campaign_member(camp_id, user_id):
+                    cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
                     conn.commit()
-
-                cur.execute("SELECT name FROM campaigns WHERE id=?", (int(camp_id),))
-                campname = (cur.fetchone() or ["Campanha"])[0]
-                conn.close()
-
-                guild = bot.get_guild(SERVER_ID)
-                if guild:
-                    m = await fetch_member_safe(guild, int(user_id))
-                    if m:
+                    conn.close()
+                    if target_member:
                         await notify_user(
-                            m,
-                            f"✅ O teu vídeo foi **aprovado** na campanha **{campname}**.\n"
-                            "📊 Usa o botão **Estatísticas** para acompanhar views e ganhos.",
+                            target_member,
+                            "❌ O teu link não foi aprovado porque já não estás na campanha.\n"
+                            f"🔗 {post_url}",
+                            fallback_channel_id=CHAT_CHANNEL_ID
+                        )
+                    try:
+                        await interaction.message.edit(view=None)
+                    except:
+                        pass
+                    await safe_reply(interaction, "✅ Rejeitado (user já saiu da campanha).", ephemeral=True)
+                    return
+
+                if str(camp_status) != "active":
+                    # campanha terminou, não aprovar
+                    if is_approve:
+                        cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
+                        conn.commit()
+                        conn.close()
+                        if target_member:
+                            await notify_user(
+                                target_member,
+                                "❌ O teu link não foi aprovado porque a campanha já terminou.\n"
+                                f"🔗 {post_url}",
+                                fallback_channel_id=CHAT_CHANNEL_ID
+                            )
+                        try:
+                            await interaction.message.edit(view=None)
+                        except:
+                            pass
+                        await safe_reply(interaction, "✅ Não aprovado (campanha terminada).", ephemeral=True)
+                        return
+
+                if is_approve:
+                    approved_count, _, _ = get_user_submission_counts(camp_id, user_id)
+                    if approved_count >= MAX_APPROVED_PER_USER:
+                        cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
+                        conn.commit()
+                        conn.close()
+                        if target_member:
+                            await notify_user(
+                                target_member,
+                                f"⛔ O teu link não foi aprovado porque já tens **{MAX_APPROVED_PER_USER} vídeos aprovados** nesta campanha.\n"
+                                f"🔗 {post_url}",
+                                fallback_channel_id=CHAT_CHANNEL_ID
+                            )
+                        try:
+                            await interaction.message.edit(view=None)
+                        except:
+                            pass
+                        await safe_reply(interaction, "✅ Rejeitado (limite de aprovados atingido).", ephemeral=True)
+                        return
+
+                    cur.execute("UPDATE submissions SET status='approved', approved_at=? WHERE id=?", (_now(), int(sid)))
+                    conn.commit()
+                    conn.close()
+
+                    if target_member:
+                        await notify_user(
+                            target_member,
+                            "✅ O teu vídeo foi **aprovado**!\n"
+                            f"🔗 {post_url}",
                             fallback_channel_id=CHAT_CHANNEL_ID
                         )
 
+                    await safe_reply(interaction, f"✅ Aprovado. (Campanha: {camp_name})", ephemeral=True)
+
+                else:
+                    cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
+                    conn.commit()
+                    conn.close()
+                    if target_member:
+                        await notify_user(
+                            target_member,
+                            "❌ O teu vídeo foi **rejeitado**.\n"
+                            f"🔗 {post_url}",
+                            fallback_channel_id=CHAT_CHANNEL_ID
+                        )
+                    await safe_reply(interaction, f"✅ Rejeitado. (Campanha: {camp_name})", ephemeral=True)
+
+                # remove botões
                 try:
                     await interaction.message.edit(view=None)
                 except:
                     pass
 
+                # atualiza leaderboard
                 await update_leaderboard_for_campaign(int(camp_id))
-                return await safe_reply(interaction, "✅ Link aprovado e user notificado.", ephemeral=True)
+                return
 
-            if action == "reject":
-                cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (sub_id,))
-                conn.commit()
-                conn.close()
-                try:
-                    await interaction.message.edit(view=None)
-                except:
-                    pass
-                return await safe_reply(interaction, "❌ Link rejeitado.", ephemeral=True)
+        # fallback: deixa comandos/app commands funcionar
+        await bot.process_application_commands(interaction)
 
     except Exception as e:
         print("⚠️ on_interaction erro:", e)
         traceback.print_exc()
         try:
-            if interaction and not interaction.response.is_done():
-                await interaction.response.send_message("⚠️ Erro interno. Vê os logs no Render.", ephemeral=True)
+            await safe_reply(interaction, "⚠️ Ocorreu um erro ao processar a interação.", ephemeral=True)
         except:
             pass
 
