@@ -71,7 +71,7 @@ CAMPAIGN_SUBMISSION_LOCK_PCT = float((os.getenv("CAMPAIGN_SUBMISSION_LOCK_PCT", 
 
 # LIMITES / MENSAGENS
 MAX_APPROVED_PER_USER = int(os.getenv("MAX_APPROVED_PER_USER", "10").strip() or "10")
-PAYMENTS_NOTICE = "✅ Pagamentos serão enviados em breve (**3–7 dias úteis**)."
+PAYMENTS_NOTICE = "✅ A campanha terminou. **Aguarda o pagamento** — será enviado em **3–7 dias úteis**."
 
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
 print("DB_PATH:", DB_PATH)
@@ -208,6 +208,22 @@ async def notify_user(
             except:
                 pass
         return False
+
+async def safe_send_modal(interaction: discord.Interaction, modal: discord.ui.Modal, fallback_text: str = "⚠️ Tenta novamente."):
+    """
+    Evita o 'Ocorreu um erro' quando o Discord acha que a interação já foi respondida.
+    """
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(fallback_text, ephemeral=True)
+            return
+        await interaction.response.send_modal(modal)
+    except Exception as e:
+        print("⚠️ safe_send_modal falhou:", e)
+        try:
+            await safe_reply(interaction, fallback_text, ephemeral=True)
+        except:
+            pass
 
 def detect_platform(url: str) -> str:
     u = (url or "").lower()
@@ -357,7 +373,6 @@ def init_db():
         except Exception as e:
             print("⚠️ MIGRATION campaigns.campaign_role_id:", e)
 
-    # evita spam de notificações quando campanha termina
     if not _column_exists(conn, "campaigns", "ended_notified"):
         try:
             cur.execute("ALTER TABLE campaigns ADD COLUMN ended_notified INTEGER NOT NULL DEFAULT 0")
@@ -432,6 +447,13 @@ def get_iban(user_id: int):
     row = cur.fetchone()
     conn.close()
     return row
+
+def delete_iban(user_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ibans WHERE user_id=?", (int(user_id),))
+    conn.commit()
+    conn.close()
 
 # ===== VERIFICAÇÃO HELPERS =====
 def upsert_verification_request(user_id: int, social: str, username: str, code: str, status: str = "pending"):
@@ -583,12 +605,34 @@ def set_maxed_notified(campaign_id: int, user_id: int):
     conn.close()
 
 def reset_user_in_campaign(campaign_id: int, user_id: int):
-    # APAGA TUDO (submissions + stats + membership) => ao voltar a aderir, não conta nada antigo
+    """
+    APAGA TUDO do user na campanha (submissions + stats + membership)
+    E devolve o budget já contabilizado desse user (paid_kz) ao budget da campanha.
+    """
     conn = db_conn()
     cur = conn.cursor()
+
+    cur.execute("SELECT COALESCE(paid_kz,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
+                (int(campaign_id), int(user_id)))
+    user_paid_kz = int((cur.fetchone() or [0])[0] or 0)
+
     cur.execute("DELETE FROM submissions WHERE campaign_id=? AND user_id=?", (int(campaign_id), int(user_id)))
     cur.execute("DELETE FROM campaign_users WHERE campaign_id=? AND user_id=?", (int(campaign_id), int(user_id)))
     cur.execute("DELETE FROM campaign_members WHERE campaign_id=? AND user_id=?", (int(campaign_id), int(user_id)))
+
+    if user_paid_kz > 0:
+        cur.execute("SELECT spent_kz, budget_total_kz, status FROM campaigns WHERE id=?", (int(campaign_id),))
+        row = cur.fetchone() or (0, 0, "active")
+        spent_kz = int(row[0] or 0)
+        budget_total = int(row[1] or 0)
+        status = str(row[2] or "active")
+
+        new_spent = max(0, spent_kz - user_paid_kz)
+        cur.execute("UPDATE campaigns SET spent_kz=? WHERE id=?", (int(new_spent), int(campaign_id)))
+
+        if status == "ended" and new_spent < budget_total:
+            cur.execute("UPDATE campaigns SET status='active', ended_notified=0 WHERE id=?", (int(campaign_id),))
+
     conn.commit()
     conn.close()
 
@@ -723,8 +767,9 @@ class MainView(discord.ui.View):
 class IbanButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(discord.ui.Button(label="Adicionar / Atualizar IBAN", style=discord.ButtonStyle.primary, custom_id="vz:iban:add"))
-        self.add_item(discord.ui.Button(label="Ver meu IBAN", style=discord.ButtonStyle.secondary, custom_id="vz:iban:view"))
+        self.add_item(discord.ui.Button(label="🏦 Adicionar/Alterar IBAN (Angola)", style=discord.ButtonStyle.primary, custom_id="vz:iban:add"))
+        self.add_item(discord.ui.Button(label="👁️ Ver meu IBAN", style=discord.ButtonStyle.secondary, custom_id="vz:iban:view"))
+        self.add_item(discord.ui.Button(label="🗑️ Apagar meu IBAN", style=discord.ButtonStyle.danger, custom_id="vz:iban:delete"))
 
 class JoinCampaignView(discord.ui.View):
     def __init__(self):
@@ -761,6 +806,11 @@ class ChooseSocialView(discord.ui.View):
 # =========================
 # SUPORTE
 # =========================
+class CloseTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="✅ Fechar ticket", style=discord.ButtonStyle.danger, custom_id="vz:ticket:close"))
+
 class SupportCampaignModal(discord.ui.Modal):
     def __init__(self):
         super().__init__(title="Problema com Campanha")
@@ -781,16 +831,47 @@ class SupportCampaignModal(discord.ui.Modal):
         self.add_item(self.problem)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await safe_reply(interaction, "✅ Recebido. O staff vai analisar e responder-te.", ephemeral=True)
+        await safe_reply(interaction, "✅ Recebido. Vou abrir um ticket privado contigo e o staff.", ephemeral=True)
+
         guild = interaction.guild or bot.get_guild(SERVER_ID)
-        staff_ch = guild.get_channel(SUPORTE_STAFF_CHANNEL_ID) if guild else None
-        if staff_ch:
-            await staff_ch.send(
-                "🆘 **Novo ticket — Problema com Campanha**\n"
+        if not guild:
+            return
+
+        support_ch = guild.get_channel(SUPORTE_CHANNEL_ID)
+        if not support_ch:
+            return
+
+        admin_member = guild.get_member(ADMIN_USER_ID) or await fetch_member_safe(guild, ADMIN_USER_ID)
+
+        try:
+            thread = await support_ch.create_thread(
+                name=f"🆘 Campanha • {interaction.user.name}",
+                type=discord.ChannelType.private_thread,
+                auto_archive_duration=1440
+            )
+
+            await thread.add_user(interaction.user)
+            if admin_member:
+                await thread.add_user(admin_member)
+
+            await thread.send(
+                "🆘 **Ticket — Problema com Campanha**\n"
                 f"👤 {interaction.user.mention} (`{interaction.user.id}`)\n"
                 f"🎯 Campanha: **{self.campaign_name.value}**\n"
-                f"📝 Problema:\n{self.problem.value}"
+                f"📝 Problema:\n{self.problem.value}\n\n"
+                "✅ O staff vai responder aqui.",
+                view=CloseTicketView()
             )
+        except Exception as e:
+            print("⚠️ erro a criar thread privada:", e)
+            staff_ch = guild.get_channel(SUPORTE_STAFF_CHANNEL_ID)
+            if staff_ch:
+                await staff_ch.send(
+                    "🆘 **Novo ticket — Problema com Campanha**\n"
+                    f"👤 {interaction.user.mention} (`{interaction.user.id}`)\n"
+                    f"🎯 Campanha: **{self.campaign_name.value}**\n"
+                    f"📝 Problema:\n{self.problem.value}"
+                )
 
 class SupportQuestionModal(discord.ui.Modal):
     def __init__(self):
@@ -821,11 +902,11 @@ class SupportView(discord.ui.View):
 
     @discord.ui.button(label="📌 Problema com campanha", style=discord.ButtonStyle.danger, custom_id="vz:support:campaign")
     async def support_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SupportCampaignModal())
+        await safe_send_modal(interaction, SupportCampaignModal(), fallback_text="⚠️ Tenta novamente abrir **Problema com campanha**.")
 
     @discord.ui.button(label="💬 Dúvidas", style=discord.ButtonStyle.primary, custom_id="vz:support:question")
     async def support_question(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SupportQuestionModal())
+        await safe_send_modal(interaction, SupportQuestionModal(), fallback_text="⚠️ Tenta novamente abrir **Dúvidas**.")
 
 # =========================
 # MODALS
@@ -987,7 +1068,6 @@ class SubmitLinkModal(discord.ui.Modal):
                 view=submission_approval_view(submission_id)
             )
 
-        # pode submeter > 10, mas só 10 aprovados (avisinho)
         approved, _, _ = get_user_submission_counts(int(camp_id), int(interaction.user.id))
         extra = ""
         if approved >= MAX_APPROVED_PER_USER:
@@ -1111,7 +1191,7 @@ async def ensure_campaign_workspace_private(
     details_ch = await guild.create_text_channel("1-detalhes-da-campanha", category=category, overwrites=overw_ro)
     req_ch = await guild.create_text_channel("2-requisitos", category=category, overwrites=overw_ro)
     submit_ch = await guild.create_text_channel("3-submeter-links", category=category, overwrites=overw_submit)
-    lb_ch = await guild.create_text_channel("4-leaderboard", category=category, overwrites=overw_ro)
+    lb_ch = await guild.create_text_channel("4-tabela-de-classificacao", category=category, overwrites=overw_ro)
 
     cobj = {
         "name": name,
@@ -1127,7 +1207,7 @@ async def ensure_campaign_workspace_private(
     await req_ch.send(requirements_text(cobj))
 
     submit_panel = await submit_ch.send("📤 **Submete os teus links aqui**\n\nUsa os botões 👇", view=submit_view(camp_id))
-    lb_msg = await lb_ch.send("🏆 **LEADERBOARD**\n(aguarda atualizações automáticas)")
+    lb_msg = await lb_ch.send("🏆 **Tabela de classificação**\n(aguarda atualizações automáticas)")
 
     set_campaign_workspace_ids(
         campaign_id=camp_id,
@@ -1270,7 +1350,7 @@ async def endcampaign(ctx, campaign_id: int):
 async def kickfromcampaign(ctx, campaign_id: int, user: discord.Member):
     reset_user_in_campaign(int(campaign_id), int(user.id))
     await update_leaderboard_for_campaign(int(campaign_id))
-    await ctx.send(f"✅ {user.mention} removido da campanha {campaign_id} e leaderboard atualizado.")
+    await ctx.send(f"✅ {user.mention} removido da campanha {campaign_id} e tabela atualizada.")
 
 # =========================
 # REATTACH PANELS
@@ -1318,7 +1398,7 @@ async def reattach_submit_panels():
             pass
 
 # =========================
-# LEADERBOARD
+# TABELA DE CLASSIFICAÇÃO
 # =========================
 async def update_leaderboard_for_campaign(campaign_id: int):
     guild = bot.get_guild(SERVER_ID)
@@ -1338,7 +1418,6 @@ async def update_leaderboard_for_campaign(campaign_id: int):
 
     lb_ch_id, lb_msg_id, name, spent, budget, status, rate = camp
 
-    # ✅ remove do leaderboard quem saiu: join com campaign_members
     cur.execute("""
     SELECT s.user_id,
            COALESCE(SUM(s.views_current),0) AS views_current_sum,
@@ -1366,7 +1445,7 @@ async def update_leaderboard_for_campaign(campaign_id: int):
 
     progress = pct(int(spent), int(budget)) * 100.0
     lines = [
-        f"🏆 **LEADERBOARD — {name}**",
+        f"🏆 **Tabela de classificação — {name}**",
         f"💰 **Gasto:** {int(spent):,}/{int(budget):,} Kz (**{progress:.1f}%**) | 📌 **Estado:** {status}",
         f"💵 Taxa: **{int(rate)} Kz / 1.000 views**",
         ""
@@ -1554,7 +1633,6 @@ async def refresh_views_once() -> None:
     for (sub_id, camp_id, user_id, url, paid_views,
          rate, budget_total, spent_kz, max_user_kz, camp_status, ended_notified) in rows:
 
-        # se já acabou budget mas ainda está active por algum motivo
         remaining_budget_now = max(0, int(budget_total) - int(spent_kz))
         if remaining_budget_now <= 0:
             connx = db_conn()
@@ -1637,7 +1715,6 @@ async def refresh_views_once() -> None:
         conn2.close()
         touched_campaigns.add(int(camp_id))
 
-        # notificar max por pessoa (já tinhas)
         new_paid = already_paid_kz + int(to_pay_kz)
         if new_paid >= int(max_user_kz) and maxed_notified_u == 0:
             guild = bot.get_guild(SERVER_ID)
@@ -1652,7 +1729,6 @@ async def refresh_views_once() -> None:
                     )
                     set_maxed_notified(int(camp_id), int(user_id))
 
-        # ✅ se este pagamento fechou o budget: termina e notifica 1x
         new_spent = int(spent_kz) + int(to_pay_kz)
         if new_spent >= int(budget_total):
             connz = db_conn()
@@ -1711,18 +1787,16 @@ async def on_interaction(interaction: discord.Interaction):
                 return
 
             if custom_id.startswith("vz:connect:"):
-                # vz:connect:<social>:<code>
                 parts = custom_id.split(":")
                 if len(parts) >= 4:
                     social = parts[2]
                     code = parts[3]
-                    await interaction.response.send_modal(UsernameModal(social=social, code=code))
+                    await safe_send_modal(interaction, UsernameModal(social=social, code=code), fallback_text="⚠️ Tenta novamente ligar a conta.")
                 else:
                     await safe_reply(interaction, "⚠️ Botão inválido.", ephemeral=True)
                 return
 
             if custom_id == "vz:view_account":
-                # mostra status + iban
                 vr = get_verification_request(int(interaction.user.id))
                 iban = get_iban(int(interaction.user.id))
                 status = "NÃO LIGADO"
@@ -1752,7 +1826,7 @@ async def on_interaction(interaction: discord.Interaction):
                 member = await fetch_member_safe(guild, interaction.user.id)
                 if not member or not is_verified(member):
                     return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para guardar IBAN.", ephemeral=True)
-                await interaction.response.send_modal(IbanModal())
+                await safe_send_modal(interaction, IbanModal(), fallback_text="⚠️ Tenta novamente abrir o painel de IBAN.")
                 return
 
             if custom_id == "vz:iban:view":
@@ -1767,20 +1841,47 @@ async def on_interaction(interaction: discord.Interaction):
                 await safe_reply(interaction, f"🏦 O teu IBAN: **{masked}**", ephemeral=True)
                 return
 
-            # -------- SUPPORT --------
+            if custom_id == "vz:iban:delete":
+                member = await fetch_member_safe(guild, interaction.user.id)
+                if not member or not is_verified(member):
+                    return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para gerir IBAN.", ephemeral=True)
+
+                row = get_iban(int(interaction.user.id))
+                if not row:
+                    return await safe_reply(interaction, "⚠️ Ainda não tens IBAN guardado.", ephemeral=True)
+
+                delete_iban(int(interaction.user.id))
+                return await safe_reply(interaction, "✅ IBAN apagado com sucesso.", ephemeral=True)
+
+            # -------- SUPPORT (fallback router) --------
             if custom_id == "vz:support:campaign":
-                await interaction.response.send_modal(SupportCampaignModal())
+                await safe_send_modal(interaction, SupportCampaignModal(), fallback_text="⚠️ Tenta novamente abrir **Problema com campanha**.")
                 return
             if custom_id == "vz:support:question":
-                await interaction.response.send_modal(SupportQuestionModal())
+                await safe_send_modal(interaction, SupportQuestionModal(), fallback_text="⚠️ Tenta novamente abrir **Dúvidas**.")
                 return
+
+            # -------- CLOSE TICKET --------
+            if custom_id == "vz:ticket:close":
+                if interaction.user.id != ADMIN_USER_ID and not getattr(interaction.user, "guild_permissions", None).administrator:
+                    return await safe_reply(interaction, "⛔ Só o staff pode fechar tickets.", ephemeral=True)
+
+                try:
+                    ch = interaction.channel
+                    if isinstance(ch, discord.Thread):
+                        await ch.send("✅ Ticket fechado pelo staff. Obrigado!")
+                        await ch.edit(archived=True, locked=True)
+                        return await safe_reply(interaction, "✅ Ticket fechado.", ephemeral=True)
+                    return await safe_reply(interaction, "⚠️ Este botão só funciona dentro do ticket (thread).", ephemeral=True)
+                except Exception as e:
+                    print("⚠️ fechar ticket erro:", e)
+                    return await safe_reply(interaction, "⚠️ Não consegui fechar o ticket agora.", ephemeral=True)
 
             # -------- VERIFY APPROVAL --------
             if custom_id.startswith("vz:verify:approve:") or custom_id.startswith("vz:verify:reject:"):
                 is_approve = custom_id.startswith("vz:verify:approve:")
                 user_id = int(custom_id.split(":")[-1])
 
-                # só admin
                 if interaction.user.id != ADMIN_USER_ID and not getattr(interaction.user, "guild_permissions", None).administrator:
                     return await safe_reply(interaction, "⛔ Sem permissão.", ephemeral=True)
 
@@ -1796,14 +1897,20 @@ async def on_interaction(interaction: discord.Interaction):
                         except:
                             pass
                     set_verification_status(user_id, "approved")
-                    await notify_user(target_member, "✅ A tua verificação foi **aprovada**!", fallback_channel_id=CHAT_CHANNEL_ID)
+
+                    await notify_user(
+                        target_member,
+                        "✅ A tua verificação foi **aprovada**!\n\n"
+                        "🏦 Agora adiciona o teu **IBAN Angolano** (para receber pagamentos).",
+                        fallback_channel_id=CHAT_CHANNEL_ID,
+                        view=IbanButtons()
+                    )
                     await safe_reply(interaction, "✅ Verificação aprovada.", ephemeral=True)
                 else:
                     set_verification_status(user_id, "rejected")
                     await notify_user(target_member, "❌ A tua verificação foi **rejeitada**.", fallback_channel_id=CHAT_CHANNEL_ID)
                     await safe_reply(interaction, "✅ Verificação rejeitada.", ephemeral=True)
 
-                # remove botões da mensagem
                 try:
                     await interaction.message.edit(view=None)
                 except:
@@ -1816,8 +1923,6 @@ async def on_interaction(interaction: discord.Interaction):
                 if not member or not is_verified(member):
                     return await safe_reply(interaction, "⛔ Tens de estar **Verificado** para aderir a campanhas.", ephemeral=True)
 
-                # descobrir campanha pelo canal da mensagem (post no canal de campanhas)
-                # vamos pegar a última campanha com post_message_id igual ao message.id (mais seguro)
                 msg_id = getattr(interaction.message, "id", None)
                 if not msg_id:
                     return await safe_reply(interaction, "⚠️ Não consegui identificar a campanha.", ephemeral=True)
@@ -1844,7 +1949,6 @@ async def on_interaction(interaction: discord.Interaction):
                 if str(status) != "active":
                     return await safe_reply(interaction, "⚠️ Esta campanha já terminou.", ephemeral=True)
 
-                # cria role + workspace (se não existir)
                 campaign_role = await ensure_campaign_role(guild, int(camp_id), str(slug), campaign_role_id)
                 await ensure_campaign_workspace_private(
                     guild=guild,
@@ -1862,10 +1966,8 @@ async def on_interaction(interaction: discord.Interaction):
                     campaign_role=campaign_role
                 )
 
-                # add member record
                 add_campaign_member(int(camp_id), int(interaction.user.id))
 
-                # dar role
                 try:
                     await member.add_roles(campaign_role, reason="Joined campaign")
                 except:
@@ -1886,10 +1988,8 @@ async def on_interaction(interaction: discord.Interaction):
                 if not is_campaign_member(int(camp_id), int(interaction.user.id)):
                     return await safe_reply(interaction, "⚠️ Tu não estás nesta campanha.", ephemeral=True)
 
-                # remover tudo (inclui leaderboard)
                 reset_user_in_campaign(int(camp_id), int(interaction.user.id))
 
-                # remover role da campanha (se existir)
                 row = get_campaign_basic(int(camp_id))
                 if row:
                     campaign_role_id = row[16]
@@ -1909,12 +2009,12 @@ async def on_interaction(interaction: discord.Interaction):
             # -------- SUBMIT PANEL ACTIONS --------
             if custom_id.startswith("vz:submit:open:"):
                 camp_id = int(custom_id.split(":")[-1])
-                await interaction.response.send_modal(SubmitLinkModal(camp_id))
+                await safe_send_modal(interaction, SubmitLinkModal(camp_id), fallback_text="⚠️ Tenta novamente clicar em **Submeter link**.")
                 return
 
             if custom_id.startswith("vz:submit:remove:"):
                 camp_id = int(custom_id.split(":")[-1])
-                await interaction.response.send_modal(RemoveLinkModal(camp_id))
+                await safe_send_modal(interaction, RemoveLinkModal(camp_id), fallback_text="⚠️ Tenta novamente clicar em **Retirar vídeo**.")
                 return
 
             if custom_id.startswith("vz:submit:stats:"):
@@ -1981,7 +2081,6 @@ async def on_interaction(interaction: discord.Interaction):
 
                 target_member = await fetch_member_safe(guild, user_id)
 
-                # se user saiu, rejeita e remove
                 if not is_campaign_member(camp_id, user_id):
                     cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
                     conn.commit()
@@ -2001,7 +2100,6 @@ async def on_interaction(interaction: discord.Interaction):
                     return
 
                 if str(camp_status) != "active":
-                    # campanha terminou, não aprovar
                     if is_approve:
                         cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
                         conn.commit()
@@ -2067,18 +2165,19 @@ async def on_interaction(interaction: discord.Interaction):
                         )
                     await safe_reply(interaction, f"✅ Rejeitado. (Campanha: {camp_name})", ephemeral=True)
 
-                # remove botões
                 try:
                     await interaction.message.edit(view=None)
                 except:
                     pass
 
-                # atualiza leaderboard
                 await update_leaderboard_for_campaign(int(camp_id))
                 return
 
         # fallback: deixa comandos/app commands funcionar
-        await bot.process_application_commands(interaction)
+        try:
+            await bot.process_application_commands(interaction)
+        except Exception:
+            pass
 
     except Exception as e:
         print("⚠️ on_interaction erro:", e)
@@ -2100,6 +2199,7 @@ async def on_ready():
         bot.add_view(IbanButtons())
         bot.add_view(JoinCampaignView())
         bot.add_view(SupportView())
+        bot.add_view(CloseTicketView())
         bot._views_added = True
 
     try:
