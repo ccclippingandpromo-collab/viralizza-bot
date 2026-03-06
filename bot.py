@@ -69,6 +69,17 @@ CAMPAIGN_SUBMISSION_LOCK_PCT = float((os.getenv("CAMPAIGN_SUBMISSION_LOCK_PCT", 
 MAX_APPROVED_PER_USER = int(os.getenv("MAX_APPROVED_PER_USER", "10").strip() or "10")
 PAYMENTS_NOTICE = "✅ A campanha terminou. **Aguarda o pagamento** — será enviado em **3–7 dias úteis**."
 
+# =========================
+# SCHEDULER DE VIEWS
+# =========================
+NEW_VIDEO_CHECK_HOURS = int((os.getenv("NEW_VIDEO_CHECK_HOURS", "4").strip() or "4"))
+AFTER_7_DAYS_CHECK_HOURS = int((os.getenv("AFTER_7_DAYS_CHECK_HOURS", "12").strip() or "12"))
+AFTER_30_DAYS_CHECK_HOURS = int((os.getenv("AFTER_30_DAYS_CHECK_HOURS", "24").strip() or "24"))
+
+STALE_GROWTH_MIN_VIEWS = int((os.getenv("STALE_GROWTH_MIN_VIEWS", "200").strip() or "200"))
+STALE_CHECKS_TO_SLOW = int((os.getenv("STALE_CHECKS_TO_SLOW", "3").strip() or "3"))
+STALE_SLOW_CHECK_HOURS = int((os.getenv("STALE_SLOW_CHECK_HOURS", "24").strip() or "24"))
+
 print("DISCORD VERSION:", getattr(discord, "__version__", "unknown"))
 print("DB_PATH:", DB_PATH)
 print("APIFY_TOKEN set:", bool(APIFY_TOKEN))
@@ -80,6 +91,12 @@ print("APIFY_PROXY_COUNTRY:", APIFY_PROXY_COUNTRY)
 print("APIFY_PROXY_GROUPS:", APIFY_PROXY_GROUPS)
 print("CAMPAIGN_SUBMISSION_LOCK_PCT:", CAMPAIGN_SUBMISSION_LOCK_PCT)
 print("MAX_APPROVED_PER_USER:", MAX_APPROVED_PER_USER)
+print("NEW_VIDEO_CHECK_HOURS:", NEW_VIDEO_CHECK_HOURS)
+print("AFTER_7_DAYS_CHECK_HOURS:", AFTER_7_DAYS_CHECK_HOURS)
+print("AFTER_30_DAYS_CHECK_HOURS:", AFTER_30_DAYS_CHECK_HOURS)
+print("STALE_GROWTH_MIN_VIEWS:", STALE_GROWTH_MIN_VIEWS)
+print("STALE_CHECKS_TO_SLOW:", STALE_CHECKS_TO_SLOW)
+print("STALE_SLOW_CHECK_HOURS:", STALE_SLOW_CHECK_HOURS)
 
 # =========================
 # BOT / INTENTS
@@ -336,6 +353,51 @@ def build_proxy_configuration() -> Optional[dict]:
         cfg["apifyProxyCountry"] = APIFY_PROXY_COUNTRY
     return cfg
 
+def hours_to_seconds(h: int) -> int:
+    return int(h) * 3600
+
+def compute_next_check_at(approved_at: int, stale_checks: int = 0) -> int:
+    now_ts = _now()
+    age = max(0, now_ts - int(approved_at or now_ts))
+
+    if stale_checks >= STALE_CHECKS_TO_SLOW:
+        return now_ts + hours_to_seconds(STALE_SLOW_CHECK_HOURS)
+
+    if age >= 30 * 24 * 3600:
+        return now_ts + hours_to_seconds(AFTER_30_DAYS_CHECK_HOURS)
+
+    if age >= 7 * 24 * 3600:
+        return now_ts + hours_to_seconds(AFTER_7_DAYS_CHECK_HOURS)
+
+    return now_ts + hours_to_seconds(NEW_VIDEO_CHECK_HOURS)
+
+def stop_tracking_submission(submission_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE submissions
+        SET is_tracking=0, next_check_at=NULL
+        WHERE id=?
+    """, (int(submission_id),))
+    conn.commit()
+    conn.close()
+
+def schedule_submission_after_approval(submission_id: int, approved_at: int):
+    next_check = int(approved_at) + hours_to_seconds(NEW_VIDEO_CHECK_HOURS)
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE submissions
+        SET last_checked_at=NULL,
+            next_check_at=?,
+            stale_checks=0,
+            is_tracking=1,
+            last_views_snapshot=0
+        WHERE id=?
+    """, (int(next_check), int(submission_id)))
+    conn.commit()
+    conn.close()
+
 # =========================
 # DB INIT + MIGRATIONS
 # =========================
@@ -436,6 +498,36 @@ def init_db():
     )
     """)
 
+    if not _column_exists(conn, "submissions", "last_checked_at"):
+        try:
+            cur.execute("ALTER TABLE submissions ADD COLUMN last_checked_at INTEGER")
+        except Exception as e:
+            print("⚠️ MIGRATION submissions.last_checked_at:", e)
+
+    if not _column_exists(conn, "submissions", "next_check_at"):
+        try:
+            cur.execute("ALTER TABLE submissions ADD COLUMN next_check_at INTEGER")
+        except Exception as e:
+            print("⚠️ MIGRATION submissions.next_check_at:", e)
+
+    if not _column_exists(conn, "submissions", "stale_checks"):
+        try:
+            cur.execute("ALTER TABLE submissions ADD COLUMN stale_checks INTEGER NOT NULL DEFAULT 0")
+        except Exception as e:
+            print("⚠️ MIGRATION submissions.stale_checks:", e)
+
+    if not _column_exists(conn, "submissions", "is_tracking"):
+        try:
+            cur.execute("ALTER TABLE submissions ADD COLUMN is_tracking INTEGER NOT NULL DEFAULT 1")
+        except Exception as e:
+            print("⚠️ MIGRATION submissions.is_tracking:", e)
+
+    if not _column_exists(conn, "submissions", "last_views_snapshot"):
+        try:
+            cur.execute("ALTER TABLE submissions ADD COLUMN last_views_snapshot INTEGER NOT NULL DEFAULT 0")
+        except Exception as e:
+            print("⚠️ MIGRATION submissions.last_views_snapshot:", e)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS campaign_users (
         campaign_id INTEGER NOT NULL,
@@ -461,6 +553,42 @@ def init_db():
         PRIMARY KEY (campaign_id, user_id)
     )
     """)
+
+    try:
+        cur.execute("""
+            UPDATE submissions
+            SET is_tracking=1
+            WHERE status='approved' AND (is_tracking IS NULL OR is_tracking=0)
+        """)
+    except Exception as e:
+        print("⚠️ init schedule approved is_tracking:", e)
+
+    try:
+        cur.execute("""
+            UPDATE submissions
+            SET next_check_at = COALESCE(
+                next_check_at,
+                approved_at + ?,
+                created_at + ?,
+                ?
+            )
+            WHERE status='approved' AND next_check_at IS NULL
+        """, (
+            hours_to_seconds(NEW_VIDEO_CHECK_HOURS),
+            hours_to_seconds(NEW_VIDEO_CHECK_HOURS),
+            _now() + hours_to_seconds(NEW_VIDEO_CHECK_HOURS)
+        ))
+    except Exception as e:
+        print("⚠️ init schedule next_check_at:", e)
+
+    try:
+        cur.execute("""
+            UPDATE submissions
+            SET is_tracking=0, next_check_at=NULL
+            WHERE status IN ('rejected','removed')
+        """)
+    except Exception as e:
+        print("⚠️ init schedule stop rejected/removed:", e)
 
     conn.commit()
     conn.close()
@@ -521,10 +649,6 @@ def list_linked_accounts(user_id: int):
     return rows
 
 def add_linked_account(user_id: int, social: str, username: str) -> bool:
-    """
-    Adiciona só se NÃO existir conta dessa rede.
-    Retorna True se adicionou, False se já existia.
-    """
     conn = db_conn()
     cur = conn.cursor()
     try:
@@ -962,9 +1086,6 @@ class IbanButtons(discord.ui.View):
         self.add_item(discord.ui.Button(label="🗑️ Apagar meu IBAN", style=discord.ButtonStyle.danger, custom_id="vz:iban:delete"))
 
 class LinkedAccountsManageView(discord.ui.View):
-    """
-    Mostra só botões das contas que realmente existem.
-    """
     def __init__(self, linked_rows: List[Tuple[str, str, int]]):
         super().__init__(timeout=300)
         socials_present = {str(s).lower(): str(u) for s, u, _ts in linked_rows}
@@ -1276,7 +1397,13 @@ class RejectSubmissionReasonModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, "⚠️ Esta submission já foi rejeitada.", ephemeral=True)
 
-        cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (sid,))
+        cur.execute("""
+            UPDATE submissions
+            SET status='rejected',
+                is_tracking=0,
+                next_check_at=NULL
+            WHERE id=?
+        """, (sid,))
         conn.commit()
         conn.close()
 
@@ -1476,7 +1603,13 @@ class RemoveLinkModal(discord.ui.Modal):
             conn.close()
             return await safe_reply(interaction, "⚠️ Esse vídeo já foi retirado.", ephemeral=True)
 
-        cur.execute("UPDATE submissions SET status='removed' WHERE id=?", (int(sub_id),))
+        cur.execute("""
+            UPDATE submissions
+            SET status='removed',
+                is_tracking=0,
+                next_check_at=NULL
+            WHERE id=?
+        """, (int(sub_id),))
         conn.commit()
         conn.close()
 
@@ -2122,25 +2255,41 @@ async def refresh_views_once() -> None:
         print("⚠️ [REFRESH] APIFY_TOKEN vazio.")
         return
 
+    now_ts = _now()
+
     conn = db_conn()
     cur = conn.cursor()
     cur.execute("""
-    SELECT s.id, s.campaign_id, s.user_id, s.post_url, s.paid_views,
-           c.rate_kz_per_1k, c.budget_total_kz, c.spent_kz, c.max_payout_user_kz, c.status, COALESCE(c.ended_notified,0)
+    SELECT
+        s.id, s.campaign_id, s.user_id, s.post_url, s.paid_views,
+        s.views_current, COALESCE(s.last_views_snapshot, 0),
+        COALESCE(s.stale_checks, 0), s.approved_at,
+        s.next_check_at, COALESCE(s.is_tracking, 1),
+        c.rate_kz_per_1k, c.budget_total_kz, c.spent_kz,
+        c.max_payout_user_kz, c.status, COALESCE(c.ended_notified, 0)
     FROM submissions s
     JOIN campaigns c ON c.id = s.campaign_id
-    WHERE s.status='approved' AND c.status='active'
-    """)
+    WHERE s.status='approved'
+      AND c.status='active'
+      AND COALESCE(s.is_tracking, 1)=1
+      AND s.next_check_at IS NOT NULL
+      AND s.next_check_at <= ?
+    ORDER BY s.next_check_at ASC
+    """, (int(now_ts),))
     rows = cur.fetchall()
     conn.close()
 
-    print(f"[REFRESH] submissions aprovadas encontradas: {len(rows)}")
+    print(f"[REFRESH] submissions due agora: {len(rows)}")
     touched_campaigns = set()
 
-    for (sub_id, camp_id, user_id, url, paid_views,
-         rate, budget_total, spent_kz, max_user_kz, _camp_status, ended_notified) in rows:
+    for (
+        sub_id, camp_id, user_id, url, paid_views,
+        views_current_db, last_views_snapshot,
+        stale_checks, approved_at, next_check_at, is_tracking,
+        rate, budget_total, spent_kz, max_user_kz, camp_status, ended_notified
+    ) in rows:
 
-        print(f"[REFRESH] camp={camp_id} user={user_id} url={url} paid_views={paid_views} spent={spent_kz}/{budget_total}")
+        print(f"[REFRESH] due sub={sub_id} camp={camp_id} user={user_id} url={url}")
 
         remaining_budget_now = max(0, int(budget_total) - int(spent_kz))
         if remaining_budget_now <= 0:
@@ -2150,47 +2299,18 @@ async def refresh_views_once() -> None:
             connx.commit()
             connx.close()
 
+            stop_tracking_submission(int(sub_id))
             touched_campaigns.add(int(camp_id))
+
             if int(ended_notified) == 0:
                 mark_campaign_ended_notified(int(camp_id))
                 await notify_campaign_finished(int(camp_id), winner_user_id=None, reason="budget")
             continue
 
-        views = await apify_get_views_for_url(url)
-        print(f"[REFRESH] views recebidas={views} para url={url}")
-
-        if views is None:
-            print(f"⚠️ Views None (Apify) url={url}")
-            continue
-
-        conn2 = db_conn()
-        cur2 = conn2.cursor()
-
-        cur2.execute("UPDATE submissions SET views_current=? WHERE id=?", (int(views), int(sub_id)))
-
-        payable_total = (int(views) // 1000) * 1000
-        to_pay_views = payable_total - int(paid_views)
-
-        if to_pay_views < 1000 or int(rate) <= 0:
-            print(f"[REFRESH] payable_total={payable_total} to_pay_views={to_pay_views} to_pay_kz=0")
-            conn2.commit()
-            conn2.close()
-            touched_campaigns.add(int(camp_id))
-            continue
-
-        to_pay_kz = (to_pay_views // 1000) * int(rate)
-        print(f"[REFRESH] payable_total={payable_total} to_pay_views={to_pay_views} to_pay_kz={to_pay_kz}")
-
-        cur2.execute("SELECT COALESCE(paid_kz,0), COALESCE(maxed_notified,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
-                     (int(camp_id), int(user_id)))
-        rowu = cur2.fetchone()
-        already_paid_kz = int(rowu[0]) if rowu else 0
-        maxed_notified_u = int(rowu[1]) if rowu else 0
-
-        remaining_user_kz = max(0, int(max_user_kz) - already_paid_kz)
-        if remaining_user_kz <= 0:
-            conn2.commit()
-            conn2.close()
+        paid_kz_user, maxed_notified_u = get_user_paid_in_campaign(int(camp_id), int(user_id))
+        if int(paid_kz_user) >= int(max_user_kz):
+            print(f"[REFRESH] sub={sub_id} parado: user max payout atingido")
+            stop_tracking_submission(int(sub_id))
             touched_campaigns.add(int(camp_id))
 
             if maxed_notified_u == 0:
@@ -2207,6 +2327,38 @@ async def refresh_views_once() -> None:
                 set_maxed_notified(int(camp_id), int(user_id))
             continue
 
+        views = await apify_get_views_for_url(url)
+        print(f"[REFRESH] views recebidas={views} para url={url}")
+
+        if views is None:
+            retry_next = now_ts + hours_to_seconds(NEW_VIDEO_CHECK_HOURS)
+            conn_retry = db_conn()
+            c_retry = conn_retry.cursor()
+            c_retry.execute("""
+                UPDATE submissions
+                SET last_checked_at=?, next_check_at=?
+                WHERE id=?
+            """, (int(now_ts), int(retry_next), int(sub_id)))
+            conn_retry.commit()
+            conn_retry.close()
+            print(f"⚠️ Views None (Apify) url={url}")
+            continue
+
+        growth_since_last = int(views) - int(last_views_snapshot or 0)
+        new_stale_checks = int(stale_checks or 0)
+
+        if growth_since_last < STALE_GROWTH_MIN_VIEWS:
+            new_stale_checks += 1
+        else:
+            new_stale_checks = 0
+
+        payable_total = (int(views) // 1000) * 1000
+        to_pay_views = payable_total - int(paid_views)
+        to_pay_kz = 0
+        if to_pay_views >= 1000 and int(rate) > 0:
+            to_pay_kz = (to_pay_views // 1000) * int(rate)
+
+        remaining_user_kz = max(0, int(max_user_kz) - int(paid_kz_user))
         if to_pay_kz > remaining_user_kz:
             max_blocks = remaining_user_kz // int(rate)
             to_pay_views = max_blocks * 1000
@@ -2218,46 +2370,68 @@ async def refresh_views_once() -> None:
             to_pay_views = max_blocks * 1000
             to_pay_kz = max_blocks * int(rate)
 
-        if to_pay_kz <= 0:
-            conn2.commit()
-            conn2.close()
-            touched_campaigns.add(int(camp_id))
-            continue
+        next_check = compute_next_check_at(int(approved_at or now_ts), int(new_stale_checks))
+        should_stop = False
+
+        conn2 = db_conn()
+        cur2 = conn2.cursor()
 
         cur2.execute("""
-        INSERT INTO campaign_users (campaign_id, user_id, paid_kz, total_views_paid, maxed_notified)
-        VALUES (?, ?, ?, ?, 0)
-        ON CONFLICT(campaign_id, user_id) DO UPDATE SET
-            paid_kz = paid_kz + excluded.paid_kz,
-            total_views_paid = total_views_paid + excluded.total_views_paid
-        """, (int(camp_id), int(user_id), int(to_pay_kz), int(to_pay_views)))
+            UPDATE submissions
+            SET views_current=?,
+                last_views_snapshot=?,
+                stale_checks=?,
+                last_checked_at=?,
+                next_check_at=?
+            WHERE id=?
+        """, (
+            int(views),
+            int(views),
+            int(new_stale_checks),
+            int(now_ts),
+            int(next_check),
+            int(sub_id)
+        ))
 
-        cur2.execute("UPDATE submissions SET paid_views = paid_views + ? WHERE id=?",
-                     (int(to_pay_views), int(sub_id)))
+        if to_pay_kz > 0:
+            cur2.execute("""
+            INSERT INTO campaign_users (campaign_id, user_id, paid_kz, total_views_paid, maxed_notified)
+            VALUES (?, ?, ?, ?, 0)
+            ON CONFLICT(campaign_id, user_id) DO UPDATE SET
+                paid_kz = paid_kz + excluded.paid_kz,
+                total_views_paid = total_views_paid + excluded.total_views_paid
+            """, (int(camp_id), int(user_id), int(to_pay_kz), int(to_pay_views)))
 
-        cur2.execute("UPDATE campaigns SET spent_kz = spent_kz + ? WHERE id=?",
-                     (int(to_pay_kz), int(camp_id)))
+            cur2.execute("UPDATE submissions SET paid_views = paid_views + ? WHERE id=?",
+                         (int(to_pay_views), int(sub_id)))
+
+            cur2.execute("UPDATE campaigns SET spent_kz = spent_kz + ? WHERE id=?",
+                         (int(to_pay_kz), int(camp_id)))
 
         conn2.commit()
         conn2.close()
         touched_campaigns.add(int(camp_id))
 
-        new_paid = already_paid_kz + int(to_pay_kz)
-        if new_paid >= int(max_user_kz) and maxed_notified_u == 0:
-            guild = bot.get_guild(SERVER_ID)
-            if guild:
-                mem = await fetch_member_safe(guild, int(user_id))
-                if mem:
-                    await notify_user(
-                        mem,
-                        f"✅ Atingiste o teu limite nesta campanha (**{int(max_user_kz):,} Kz**). "
-                        "A partir de agora **não podes submeter mais vídeos** para esta campanha.",
-                        fallback_channel_id=CHAT_CHANNEL_ID
-                    )
-            set_maxed_notified(int(camp_id), int(user_id))
+        new_paid_total = int(paid_kz_user) + int(to_pay_kz)
+        new_spent_total = int(spent_kz) + int(to_pay_kz)
 
-        new_spent = int(spent_kz) + int(to_pay_kz)
-        if new_spent >= int(budget_total):
+        if new_paid_total >= int(max_user_kz):
+            should_stop = True
+            if maxed_notified_u == 0:
+                guild = bot.get_guild(SERVER_ID)
+                if guild:
+                    mem = await fetch_member_safe(guild, int(user_id))
+                    if mem:
+                        await notify_user(
+                            mem,
+                            f"✅ Atingiste o teu limite nesta campanha (**{int(max_user_kz):,} Kz**). "
+                            "A partir de agora **não podes submeter mais vídeos** para esta campanha.",
+                            fallback_channel_id=CHAT_CHANNEL_ID
+                        )
+                set_maxed_notified(int(camp_id), int(user_id))
+
+        if new_spent_total >= int(budget_total):
+            should_stop = True
             connz = db_conn()
             cz = connz.cursor()
             cz.execute("SELECT COALESCE(ended_notified,0) FROM campaigns WHERE id=?", (int(camp_id),))
@@ -2269,6 +2443,13 @@ async def refresh_views_once() -> None:
             if en == 0:
                 mark_campaign_ended_notified(int(camp_id))
                 await notify_campaign_finished(int(camp_id), winner_user_id=int(user_id), reason="budget")
+
+        age_now = max(0, now_ts - int(approved_at or now_ts))
+        if age_now >= 30 * 24 * 3600 and int(new_stale_checks) >= 5:
+            should_stop = True
+
+        if should_stop:
+            stop_tracking_submission(int(sub_id))
 
     for cid in touched_campaigns:
         await update_leaderboard_for_campaign(int(cid))
@@ -2301,7 +2482,6 @@ async def on_interaction(interaction: discord.Interaction):
             if not guild:
                 return
 
-            # CONNECT
             if custom_id == "vz:connect":
                 code = generate_verification_code()
                 await safe_reply(
@@ -2363,7 +2543,6 @@ async def on_interaction(interaction: discord.Interaction):
                 )
                 return
 
-            # UNLINK ACCOUNTS
             if custom_id.startswith("vz:unlink:"):
                 member = await fetch_member_safe(guild, interaction.user.id)
                 if not member or not is_verified(member):
@@ -2377,7 +2556,6 @@ async def on_interaction(interaction: discord.Interaction):
                 delete_linked_account(int(interaction.user.id), social)
                 return await safe_reply(interaction, f"✅ Conta de **{social_pretty_name(social)}** removida com sucesso.", ephemeral=True)
 
-            # IBAN
             if custom_id == "vz:iban:add":
                 member = await fetch_member_safe(guild, interaction.user.id)
                 if not member or not is_verified(member):
@@ -2409,7 +2587,6 @@ async def on_interaction(interaction: discord.Interaction):
                 delete_iban(int(interaction.user.id))
                 return await safe_reply(interaction, "✅ IBAN apagado com sucesso.", ephemeral=True)
 
-            # SUPPORT
             if custom_id == "vz:support:campaign":
                 await safe_send_modal(interaction, SupportCampaignModal(), fallback_text="⚠️ Tenta novamente abrir **Problema com campanha**.")
                 return
@@ -2417,7 +2594,6 @@ async def on_interaction(interaction: discord.Interaction):
                 await safe_send_modal(interaction, SupportQuestionModal(), fallback_text="⚠️ Tenta novamente abrir **Dúvidas**.")
                 return
 
-            # CLOSE TICKET
             if custom_id == "vz:ticket:close":
                 member = await fetch_member_safe(guild, interaction.user.id)
                 if not member or not is_staff_member(member):
@@ -2434,7 +2610,6 @@ async def on_interaction(interaction: discord.Interaction):
                     print("⚠️ fechar ticket erro:", e)
                     return await safe_reply(interaction, "⚠️ Não consegui fechar o ticket agora.", ephemeral=True)
 
-            # VERIFY APPROVAL
             if custom_id.startswith("vz:verify:approve:") or custom_id.startswith("vz:verify:reject:"):
                 member = await fetch_member_safe(guild, interaction.user.id)
                 if not member or not is_staff_member(member):
@@ -2487,7 +2662,6 @@ async def on_interaction(interaction: discord.Interaction):
                     pass
                 return
 
-            # JOIN CAMPAIGN
             if custom_id == "vz:camp:join":
                 m = await fetch_member_safe(guild, interaction.user.id)
                 if not m or not is_verified(m):
@@ -2551,7 +2725,6 @@ async def on_interaction(interaction: discord.Interaction):
                 )
                 return
 
-            # LEAVE CAMPAIGN
             if custom_id.startswith("vz:camp:leave:"):
                 camp_id = int(custom_id.split(":")[-1])
 
@@ -2568,7 +2741,6 @@ async def on_interaction(interaction: discord.Interaction):
                 await safe_reply(interaction, "✅ Saíste da campanha e foi feito reset (vídeos/estatísticas removidos).", ephemeral=True)
                 return
 
-            # SUBMIT PANEL
             if custom_id.startswith("vz:submit:open:"):
                 camp_id = int(custom_id.split(":")[-1])
                 await safe_send_modal(interaction, SubmitLinkModal(camp_id), fallback_text="⚠️ Tenta novamente clicar em **Submeter link**.")
@@ -2615,7 +2787,6 @@ async def on_interaction(interaction: discord.Interaction):
                 )
                 return
 
-            # SUBMISSION APPROVAL
             if custom_id.startswith("vz:sub:approve:") or custom_id.startswith("vz:sub:reject:"):
                 staff = await fetch_member_safe(guild, interaction.user.id)
                 if not staff or not is_staff_member(staff):
@@ -2647,7 +2818,13 @@ async def on_interaction(interaction: discord.Interaction):
                 target_member = await fetch_member_safe(guild, user_id)
 
                 if not is_campaign_member(camp_id, user_id):
-                    cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
+                    cur.execute("""
+                        UPDATE submissions
+                        SET status='rejected',
+                            is_tracking=0,
+                            next_check_at=NULL
+                        WHERE id=?
+                    """, (int(sid),))
                     conn.commit()
                     conn.close()
                     if target_member:
@@ -2666,7 +2843,13 @@ async def on_interaction(interaction: discord.Interaction):
                     return
 
                 if str(camp_status) != "active" and is_approve:
-                    cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
+                    cur.execute("""
+                        UPDATE submissions
+                        SET status='rejected',
+                            is_tracking=0,
+                            next_check_at=NULL
+                        WHERE id=?
+                    """, (int(sid),))
                     conn.commit()
                     conn.close()
                     if target_member:
@@ -2686,7 +2869,13 @@ async def on_interaction(interaction: discord.Interaction):
 
                 paid_kz, _mn = get_user_paid_in_campaign(int(camp_id), int(user_id))
                 if paid_kz >= max_user_kz and is_approve:
-                    cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
+                    cur.execute("""
+                        UPDATE submissions
+                        SET status='rejected',
+                            is_tracking=0,
+                            next_check_at=NULL
+                        WHERE id=?
+                    """, (int(sid),))
                     conn.commit()
                     conn.close()
                     if target_member:
@@ -2707,7 +2896,13 @@ async def on_interaction(interaction: discord.Interaction):
                 if is_approve:
                     approved_count, _, _ = get_user_submission_counts(camp_id, user_id)
                     if approved_count >= MAX_APPROVED_PER_USER:
-                        cur.execute("UPDATE submissions SET status='rejected' WHERE id=?", (int(sid),))
+                        cur.execute("""
+                            UPDATE submissions
+                            SET status='rejected',
+                                is_tracking=0,
+                                next_check_at=NULL
+                            WHERE id=?
+                        """, (int(sid),))
                         conn.commit()
                         conn.close()
                         if target_member:
@@ -2725,7 +2920,22 @@ async def on_interaction(interaction: discord.Interaction):
                         await update_leaderboard_for_campaign(int(camp_id))
                         return
 
-                    cur.execute("UPDATE submissions SET status='approved', approved_at=? WHERE id=?", (_now(), int(sid)))
+                    approved_ts = _now()
+                    cur.execute("""
+                        UPDATE submissions
+                        SET status='approved',
+                            approved_at=?,
+                            is_tracking=1,
+                            stale_checks=0,
+                            last_checked_at=NULL,
+                            next_check_at=?,
+                            last_views_snapshot=0
+                        WHERE id=?
+                    """, (
+                        int(approved_ts),
+                        int(approved_ts + hours_to_seconds(NEW_VIDEO_CHECK_HOURS)),
+                        int(sid)
+                    ))
                     conn.commit()
                     conn.close()
 
