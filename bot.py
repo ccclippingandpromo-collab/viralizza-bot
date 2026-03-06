@@ -1692,10 +1692,37 @@ async def campaignid(ctx):
 
 @staff_only()
 @bot.command()
+async def debugviews(ctx, url: str):
+    if not APIFY_TOKEN:
+        return await ctx.send("⚠️ APIFY_TOKEN não está definido no Render.")
+
+    plat = detect_platform(url)
+    if plat == "tiktok":
+        url = normalize_tiktok_url(url)
+
+    actor_tk = normalize_apify_actor_id(APIFY_ACTOR_TIKTOK)
+    actor_ig = normalize_apify_actor_id(APIFY_ACTOR_INSTAGRAM)
+
+    await ctx.send(
+        "⏳ A testar no Apify…\n"
+        f"URL normalizado:\n{url}\n\n"
+        f"Actor TikTok (final): `{actor_tk}`\n"
+        f"Actor Instagram (final): `{actor_ig}`\n"
+        f"Proxy: {APIFY_USE_PROXY} country={APIFY_PROXY_COUNTRY} groups={APIFY_PROXY_GROUPS}"
+    )
+
+    v = await apify_get_views_for_url(url)
+    await ctx.send(f"📊 Views devolvidas: **{v}**")
+
+@staff_only()
+@bot.command()
 async def refreshnow(ctx):
+    if not APIFY_TOKEN:
+        return await ctx.send("⚠️ APIFY_TOKEN não está definido no Render.")
+
     await ctx.send("⏳ A correr refresh agora…")
     await refresh_views_once()
-    await ctx.send("✅ Refresh concluído (vê se o leaderboard/stats mudou).")
+    await ctx.send("✅ Refresh concluído.")
 
 @staff_only()
 @bot.command()
@@ -2092,6 +2119,7 @@ async def apify_get_views_for_url(url: str) -> Optional[int]:
 # =========================
 async def refresh_views_once() -> None:
     if not APIFY_TOKEN:
+        print("⚠️ [REFRESH] APIFY_TOKEN vazio.")
         return
 
     conn = db_conn()
@@ -2106,10 +2134,13 @@ async def refresh_views_once() -> None:
     rows = cur.fetchall()
     conn.close()
 
+    print(f"[REFRESH] submissions aprovadas encontradas: {len(rows)}")
     touched_campaigns = set()
 
     for (sub_id, camp_id, user_id, url, paid_views,
          rate, budget_total, spent_kz, max_user_kz, _camp_status, ended_notified) in rows:
+
+        print(f"[REFRESH] camp={camp_id} user={user_id} url={url} paid_views={paid_views} spent={spent_kz}/{budget_total}")
 
         remaining_budget_now = max(0, int(budget_total) - int(spent_kz))
         if remaining_budget_now <= 0:
@@ -2126,6 +2157,8 @@ async def refresh_views_once() -> None:
             continue
 
         views = await apify_get_views_for_url(url)
+        print(f"[REFRESH] views recebidas={views} para url={url}")
+
         if views is None:
             print(f"⚠️ Views None (Apify) url={url}")
             continue
@@ -2139,12 +2172,14 @@ async def refresh_views_once() -> None:
         to_pay_views = payable_total - int(paid_views)
 
         if to_pay_views < 1000 or int(rate) <= 0:
+            print(f"[REFRESH] payable_total={payable_total} to_pay_views={to_pay_views} to_pay_kz=0")
             conn2.commit()
             conn2.close()
             touched_campaigns.add(int(camp_id))
             continue
 
         to_pay_kz = (to_pay_views // 1000) * int(rate)
+        print(f"[REFRESH] payable_total={payable_total} to_pay_views={to_pay_views} to_pay_kz={to_pay_kz}")
 
         cur2.execute("SELECT COALESCE(paid_kz,0), COALESCE(maxed_notified,0) FROM campaign_users WHERE campaign_id=? AND user_id=?",
                      (int(camp_id), int(user_id)))
