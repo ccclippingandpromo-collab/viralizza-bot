@@ -371,7 +371,6 @@ def init_db():
     )
     """)
 
-    # contas ligadas (uma por user por rede)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS linked_accounts (
         user_id INTEGER NOT NULL,
@@ -521,18 +520,24 @@ def list_linked_accounts(user_id: int):
     conn.close()
     return rows
 
-def set_linked_account(user_id: int, social: str, username: str):
+def add_linked_account(user_id: int, social: str, username: str) -> bool:
+    """
+    Adiciona só se NÃO existir conta dessa rede.
+    Retorna True se adicionou, False se já existia.
+    """
     conn = db_conn()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO linked_accounts (user_id, social, username, linked_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id, social) DO UPDATE SET
-            username=excluded.username,
-            linked_at=excluded.linked_at
-    """, (int(user_id), str(social).lower(), str(username).strip(), _now()))
-    conn.commit()
-    conn.close()
+    try:
+        cur.execute("""
+            INSERT INTO linked_accounts (user_id, social, username, linked_at)
+            VALUES (?, ?, ?, ?)
+        """, (int(user_id), str(social).lower(), str(username).strip(), _now()))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
 
 def delete_linked_account(user_id: int, social: str):
     conn = db_conn()
@@ -957,11 +962,31 @@ class IbanButtons(discord.ui.View):
         self.add_item(discord.ui.Button(label="🗑️ Apagar meu IBAN", style=discord.ButtonStyle.danger, custom_id="vz:iban:delete"))
 
 class LinkedAccountsManageView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(discord.ui.Button(label="🗑️ Remover TikTok", style=discord.ButtonStyle.danger, custom_id="vz:unlink:tiktok"))
-        self.add_item(discord.ui.Button(label="🗑️ Remover Instagram", style=discord.ButtonStyle.danger, custom_id="vz:unlink:instagram"))
-        self.add_item(discord.ui.Button(label="🗑️ Remover YouTube", style=discord.ButtonStyle.danger, custom_id="vz:unlink:youtube"))
+    """
+    Mostra só botões das contas que realmente existem.
+    """
+    def __init__(self, linked_rows: List[Tuple[str, str, int]]):
+        super().__init__(timeout=300)
+        socials_present = {str(s).lower(): str(u) for s, u, _ts in linked_rows}
+
+        if "tiktok" in socials_present:
+            self.add_item(discord.ui.Button(
+                label=f"🗑️ Remover TikTok ({socials_present['tiktok']})",
+                style=discord.ButtonStyle.danger,
+                custom_id="vz:unlink:tiktok"
+            ))
+        if "instagram" in socials_present:
+            self.add_item(discord.ui.Button(
+                label=f"🗑️ Remover Instagram ({socials_present['instagram']})",
+                style=discord.ButtonStyle.danger,
+                custom_id="vz:unlink:instagram"
+            ))
+        if "youtube" in socials_present:
+            self.add_item(discord.ui.Button(
+                label=f"🗑️ Remover YouTube ({socials_present['youtube']})",
+                style=discord.ButtonStyle.danger,
+                custom_id="vz:unlink:youtube"
+            ))
 
 class JoinCampaignView(discord.ui.View):
     def __init__(self):
@@ -1148,10 +1173,9 @@ class UsernameModal(discord.ui.Modal):
         if existing:
             return await safe_reply(
                 interaction,
-                f"⚠️ Já tens uma conta de **{social_pretty_name(social)}** associada: **{existing[0]}**.\n"
-                "Remove essa conta primeiro em **Ver minha conta** para poderes ligar outra.",
-                ephemeral=True,
-                view=LinkedAccountsManageView()
+                f"⚠️ Já associou uma conta **{social_pretty_name(social)}**: **{existing[0]}**.\n"
+                "Se quiser trocar, elimine a outra e só depois adicione.",
+                ephemeral=True
             )
 
         upsert_verification_request(user_id=user_id, social=social, username=username, code=self.code, status="pending")
@@ -2286,8 +2310,10 @@ async def on_interaction(interaction: discord.Interaction):
                     for s, u, _ts in linked:
                         linked_lines.append(f"• **{social_pretty_name(str(s))}**: {u}")
                     linked_txt = "\n".join(linked_lines)
+                    linked_view: Optional[discord.ui.View] = LinkedAccountsManageView(linked)
                 else:
                     linked_txt = "Nenhuma conta associada."
+                    linked_view = None
 
                 await safe_reply(
                     interaction,
@@ -2296,10 +2322,9 @@ async def on_interaction(interaction: discord.Interaction):
                     f"📱 Última rede do pedido: **{social_pretty_name(str(social)) if social != '-' else '-'}**\n"
                     f"🏷️ Último username do pedido: **{username}**\n"
                     f"🏦 IBAN: **{iban_txt}**\n\n"
-                    f"🔗 **Contas associadas**\n{linked_txt}\n\n"
-                    "Usa os botões abaixo para remover uma conta associada.",
+                    f"🔗 **Contas associadas**\n{linked_txt}",
                     ephemeral=True,
-                    view=LinkedAccountsManageView()
+                    view=linked_view
                 )
                 return
 
@@ -2404,8 +2429,9 @@ async def on_interaction(interaction: discord.Interaction):
                     set_verification_status(user_id, "approved")
 
                     if social and username:
-                        # uma conta por rede
-                        set_linked_account(user_id, str(social).lower(), str(username).strip())
+                        existing = get_linked_account(user_id, str(social).lower())
+                        if not existing:
+                            add_linked_account(user_id, str(social).lower(), str(username).strip())
 
                     await notify_user(
                         target_member,
@@ -2414,7 +2440,7 @@ async def on_interaction(interaction: discord.Interaction):
                         fallback_channel_id=CHAT_CHANNEL_ID,
                         view=IbanButtons()
                     )
-                    await safe_reply(interaction, "✅ Verificação aprovada e conta associada guardada.", ephemeral=True)
+                    await safe_reply(interaction, "✅ Verificação aprovada.", ephemeral=True)
                 else:
                     set_verification_status(user_id, "rejected")
                     await notify_user(target_member, "❌ A tua verificação foi **rejeitada**.", fallback_channel_id=CHAT_CHANNEL_ID)
@@ -2728,7 +2754,6 @@ async def on_ready():
     if not getattr(bot, "_views_added", False):
         bot.add_view(MainView())
         bot.add_view(IbanButtons())
-        bot.add_view(LinkedAccountsManageView())
         bot.add_view(JoinCampaignView())
         bot.add_view(SupportView())
         bot.add_view(CloseTicketView())
